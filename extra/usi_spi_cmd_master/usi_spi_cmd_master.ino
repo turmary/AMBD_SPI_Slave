@@ -3,22 +3,16 @@
  by Peter Yang <turmary@126.com>
  */
 
-// the device communicates using SPI, so include the library:
 #include <SPI.h>
 
 // pins used for the connection with the device
 // the other you need are controlled by the SPI library):
 #define SPIX             SPI1
 const int chipSelectPin = SS1;
-
-#define SPI_STATE_MISO    0
-#define SPI_STATE_MOSI  (!0)
 const int chipSyncPin  =  RTL8720D_GPIO0;
 
-// SPI transfer tags, commonly used by target SPI AT device
+// SPI transfer tags, commonly used by target SPI slave device
 enum {
-	SPT_TAG_PRE = 0x55, /* Master initiate a TRANSFER */
-	SPT_TAG_ACK = 0xBE, /* Slave  Acknowledgement */
 	SPT_TAG_WR  = 0x80, /* Master WRITE  to Slave */
 	SPT_TAG_RD  = 0x00, /* Master READ from Slave */
 	SPT_TAG_DMY = 0xFF, /* dummy */
@@ -32,23 +26,20 @@ enum {
 	USPI_REG_CTRL,        /* rw */
 	USPI_REG_STS,         /* ro */
 	USPI_REG_IEN,         /* rw */
-	#define IEN_TX 0x0001     // have data to master
-	#define IEN_RX 0x0002     // have space could receive from master
+	#define IEN_STX 0x0001     // have data to master
+	#define IEN_SRX 0x0002     // have space could receive from master
 	USPI_REG_IRQ,         /* r1c */
 	USPI_REG_RLEN  = 0x10,/* rw */
 	USPI_REG_WLEN,        /* rw */
 	USPI_REG_RDATA = 0x20,/* wo */
+	#define RDATA_ACK 0x55AA
 	USPI_REG_WDATA,       /* wo */
+	#define WDATA_ACK 0xA55A
 	USPI_REG_CNT,
 };
 
-/* No less than 60 us between REG byte and VALUE bytes. */
-const int _WAIT_SLAVE_READY_US = 100;
-
-enum {
-	SPT_ERR_OK  = 0x00,
-	SPT_ERR_DEC_SPC = 0x01,
-};
+/* No less than 60 us between REG(read) byte and VALUE bytes. */
+const int _WAIT_SLAVE_READY_US = 70;
 
 int spi_transfer_cs(uint8_t v) {
   // take the chip select low to select the device
@@ -70,6 +61,7 @@ int spi_transfer16_cs(uint16_t v) {
 
   r  = 0;
   r |= SPIX.transfer(v & 0xFF);
+  delayMicroseconds(1);
   r |= SPIX.transfer(v >> 8) << 8;
 
   // take the chip select high to de-select
@@ -78,124 +70,108 @@ int spi_transfer16_cs(uint16_t v) {
 }
 
 static unsigned uspi_rd_reg(int reg) {
-  spi_transfer_cs(SPT_TAG_RD | reg);
+  uint16_t v;
+
+  /* To stable from last rd_reg/wr_reg */
   delayMicroseconds(_WAIT_SLAVE_READY_US);
-  return spi_transfer16_cs((SPT_TAG_DMY << 8) | SPT_TAG_DMY);
+  spi_transfer_cs(SPT_TAG_RD | reg);
+
+  delayMicroseconds(_WAIT_SLAVE_READY_US);
+  v = spi_transfer16_cs((SPT_TAG_DMY << 8) | SPT_TAG_DMY);
+
+  return v;
 }
 
 static int uspi_wr_reg(int reg, unsigned val) {
   int r;
 
+  /* To stable from last rd_reg/wr_reg */
+  delayMicroseconds(_WAIT_SLAVE_READY_US);
   spi_transfer_cs(SPT_TAG_WR | reg);
-  r = spi_transfer16_cs(val);
+
+  /* Maybe read & write concurrently */
   // delayMicroseconds(_WAIT_SLAVE_READY_US);
+  r = spi_transfer16_cs(val);
+
   return r;
 }
 
-int at_wait_io(int level) {
-  int i;
-  for (i = 0; digitalRead(chipSyncPin) != level; i++) {
-    delayMicroseconds(10);
-    if (i > 5000) {
-      break;
-    }
-  }
-  return 1;
-}
-
 int at_cmd_write(const uint8_t* buf, uint16_t len, int loop_wait = 50) {
-  uint8_t v;
-  int i;
+  uint16_t wlen;
+  uint16_t v;
   int r = 0;
 
-  /* wait slave ready to transfer data */
-  delayMicroseconds(_WAIT_SLAVE_READY_US);
+  // Free space could be wrote into
+  if (! (wlen = uspi_rd_reg(USPI_REG_WLEN))) {
+    goto __ret;
+  }
+  if (wlen > len)
+    wlen = len;
 
-  spi_transfer16_cs((SPT_TAG_PRE << 8) | SPT_TAG_WR);
-  spi_transfer16_cs(len);
+  // Request writting wlen bytes
+  uspi_wr_reg(USPI_REG_WLEN, wlen);
 
-
-  /* wait slave ready to transfer data */
-  at_wait_io(SPI_STATE_MISO);
-
-  v = spi_transfer_cs(SPT_TAG_DMY);
-  if (v != SPT_TAG_ACK) {
-    /* device too slow between TAG_PRE and TAG_ACK */
-    Serial.printf("No ACK, R%02X\r\n", v);
+  // Do the slave RX transfer
+  v = uspi_wr_reg(USPI_REG_WDATA, wlen);
+  if (v != WDATA_ACK) {
+    /* device something wrong happend */
+    Serial.printf("No W ACK, R%04X\r\n", v);
     r = -1;
     goto __ret;
   }
 
-  v = spi_transfer_cs(SPT_TAG_DMY);
-  if (v != SPT_ERR_OK && v != SPT_ERR_DEC_SPC) {
-    r = -1000 - v; /* device not ready */
-    goto __ret;
-  }
+  /* wait slave ready to transfer data */
+  delayMicroseconds(_WAIT_SLAVE_READY_US);
 
-  len = spi_transfer16_cs((SPT_TAG_DMY << 8) | SPT_TAG_DMY);
-
-
-  at_wait_io(SPI_STATE_MOSI);
-  for (i = 0; i < len; i++) {
+  for (int i = 0; i < wlen; i++) {
     spi_transfer_cs(buf[i]);
   }
 
-  at_wait_io(SPI_STATE_MOSI);
-
-
   Serial.print("Trans ");
-  Serial.print(len);
+  Serial.print(wlen);
   Serial.println("B");
-  r = len; /* success transfer len bytes */
+  r = wlen; /* success transfer wlen bytes */
 
 __ret:
   return r;
 }
 
 int at_cmd_read(uint8_t* buf, uint16_t len, int loop_wait = 50) {
-  uint8_t v;
-  int i;
+  uint16_t rlen;
+  uint16_t v;
   int r = 0;
 
-  /* wait slave ready to transfer data */
-  delayMicroseconds(_WAIT_SLAVE_READY_US);
+  // How many bytes could read out
+  if (! (rlen = uspi_rd_reg(USPI_REG_RLEN))) {
+    goto __ret;
+  }
 
-  spi_transfer16_cs((SPT_TAG_PRE << 8) | SPT_TAG_RD);
-  spi_transfer16_cs(len);
+  if (rlen > len)
+    rlen = len;
 
-  /* wait slave ready to transfer data */
-  at_wait_io(SPI_STATE_MISO);
-  v = spi_transfer_cs(SPT_TAG_DMY);
-  if (v != SPT_TAG_ACK) {
-    /* device too slow between TAG_PRE and TAG_ACK */
-    Serial.printf("No ACK, R%02X\r\n", v);
+  // Request reading rlen bytes
+  uspi_wr_reg(USPI_REG_RLEN, rlen);
+
+  // Do the slave TX transfer
+  v = uspi_wr_reg(USPI_REG_RDATA, rlen);
+  if (v != RDATA_ACK) {
+    /* device something wrong happend */
+    Serial.printf("No R ACK, R%04X\r\n", v);
     r = -1;
     goto __ret;
   }
 
-  v = spi_transfer_cs(SPT_TAG_DMY);
-  if (v != SPT_ERR_OK && v != SPT_ERR_DEC_SPC) {
-    r = -1000 - v; /* device not ready */
-    goto __ret;
-  }
+  if (rlen) {
+    /* wait slave ready to transfer data */
+    delayMicroseconds(_WAIT_SLAVE_READY_US);
 
-  len = spi_transfer16_cs((SPT_TAG_DMY << 8) | SPT_TAG_DMY);
-
-  at_wait_io(SPI_STATE_MOSI);
-
-  if (len) {
-    at_wait_io(SPI_STATE_MISO);
-
-    for (i = 0; i < len; i++) {
+    for (int i = 0; i < rlen; i++) {
       buf[i] = spi_transfer_cs(SPT_TAG_DMY);
     }
-    r = len; /* success transfer len bytes */
-
-    at_wait_io(SPI_STATE_MOSI);
+    r = rlen; /* success transfer rlen bytes */
   }
 
 __ret:
-
   return r;
 }
 
@@ -203,11 +179,11 @@ void setup() {
   Serial.begin(115200);
   while(!Serial);
 
-  // Reset SPI slave device
+  // Reset SPI slave device (entire RTL8720D)
   pinMode(RTL8720D_CHIP_PU, OUTPUT);
   digitalWrite(RTL8720D_CHIP_PU, LOW);
 
-  // initalize the  data ready and chip select pins:
+  // initalize the data ready and chip select pins:
   pinMode(chipSyncPin, INPUT);
   pinMode(chipSelectPin, OUTPUT);
   digitalWrite(chipSelectPin, HIGH);
@@ -228,29 +204,37 @@ void setup() {
 
   // Release RTL8720D reset, start bootup.
   digitalWrite(RTL8720D_CHIP_PU, HIGH);
+
   // give the slave time to set up
   delay(50);
   pinMode(PIN_SERIAL2_RX, INPUT);
-
-  delay(2000);
+  delay(200);
 
   char idstr[0x20];
   uint16_t id;
-
-  id = uspi_rd_reg(USPI_REG_ID);
-  sprintf(idstr, "Slave ID  = %04X", id);
+  int i;
+  for (i = 0; i < 10000; i++) {
+    id = uspi_rd_reg(USPI_REG_ID);
+    if (id != 0x8720) {
+      break;
+    }
+  }
+  sprintf(idstr, "Slave ID  = %04X loops = %d", id, i);
   Serial.println(idstr);
 
   id = uspi_rd_reg(USPI_REG_VER);
   sprintf(idstr, "Slave VER = %d.%d", id >> 8, id & 0xFF);
   Serial.println(idstr);
 
-  uspi_wr_reg(USPI_REG_IEN, IEN_TX | IEN_RX);
-  id = uspi_rd_reg(USPI_REG_IEN);
-  sprintf(idstr, "Slave IEN = %04X", id);
+  for (i = 0; i < 10000; i++) {
+    uspi_wr_reg(USPI_REG_IEN, IEN_STX | IEN_SRX);
+    id = uspi_rd_reg(USPI_REG_IEN);
+    if (id != (IEN_STX | IEN_SRX)) {
+      break;
+    }
+  }
+  sprintf(idstr, "Slave IEN = %04X loops = %d", id, i);
   Serial.println(idstr);
-
-  delay(100);
 
   Serial.println("Ready! Enter some AT commands");
 
@@ -294,6 +278,8 @@ void loop() {
       Serial.print("AT_WRITE ERR ");
       Serial.println(r);
       delay(1000);
+    } else {
+      delay(r);
     }
     idx = 0;
   }
