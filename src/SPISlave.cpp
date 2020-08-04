@@ -17,315 +17,557 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-extern "C" {
-#include <string.h>
-}
-
-#include <Arduino.h>
-#include <wiring_private.h>
-
+#include "SPI.h"
 #include "SPISlave.h"
-
-SPISlave_::SPISlave_(SERCOM * s, uint8_t pinSDA, uint8_t pinSCL)
-{
-  this->sercom = s;
-  this->_uc_pinSDA=pinSDA;
-  this->_uc_pinSCL=pinSCL;
-  transmissionBegun = false;
+extern "C" {
+  #include "gpio_irq_api.h"
+  #include "gpio_irq_ex_api.h"
 }
+
+#define USI_SPI_MOSI  PA_25
+#define USI_SPI_MISO  PA_26
+#define USI_SPI_SCLK  PA_30
+#define USI_SPI_CS    PA_28
+#define RTL87XX_IRQ0  PA_12
+#define RTL87XX_SYNC  PA_13
+
+/* IRQ0 Levels */
+#define SPI_SLAVE_BUSY  1
+/* On slave side, we haven't data to send, should named IDLE not BUSY. */
+#define SPI_SLAVE_IDLE  1
+#define SPI_SLAVE_READY 0
+
+extern "C" {
+void USI_SSI_StructInitEx(USI_SSI_InitTypeDef* USI_SSI_InitStruct);
+void USI_SSI_InitEx(USI_TypeDef *usi_dev, USI_SSI_InitTypeDef *USI_SSI_InitStruct);
+};
+
+/***************************************************************
+ Device type & version
+ ***************************************************************/
+const uint16_t DEV_ID  = 0x8720;
+const uint16_t DEV_VER = 0x0001; // 0.1(high-byte.low-byte)
+
+/***************************************************************
+ * Register definitions
+ ***************************************************************/
+enum {
+	REG_DMY = 0, /* rw */
+	REG_ID,      /* ro */
+	REG_VER,     /* ro */
+	REG_NAME,    /* ro */     // single char each read, '\0' ends.
+	REG_CTRL,    /* rw */
+	REG_STS,     /* ro */
+	REG_IEN,     /* rw */
+	#define IEN_TX 0x0001     // have data to master
+	#define IEN_RX 0x0002     // have space could receive from master
+	REG_IRQ,     /* r1c */
+	REG_RLEN = 0x10,
+	             /* rw,
+	              * R -- how many bytes could read from this slave
+	              * W -- how many bytes will  read
+	              */
+	REG_WLEN,    /* rw,
+	              * R -- how many bytes could write to this slave
+	              * W -- how many bytes will  write
+	              */
+	REG_RDATA = 0x20,
+	#define RDATA_ACK 0x55AA
+	             /* wo, will enter DATA TX transfer mode */
+	REG_WDATA,   /* wo, will enter DATA RX transfer mode */
+	#define WDATA_ACK 0xA55A
+	REG_CNT,
+
+	REG_NULL  = 0x7F,
+	REG_MASK  = 0x7F,
+	TAG_WRITE = 0x80,
+};
+
+SPISlave_::SPISlave_(USI_TypeDef* udev, int pinMOSI, int pinMISO, int pinSCLK, int pinCS, int pinIRQ2Mst)
+{
+	this->udev    = udev;
+	this->pinMOSI = pinMOSI;
+	this->pinMISO = pinMISO;
+	this->pinSCLK = pinSCLK;
+	this->pinCS   = pinCS;
+	this->pinIRQ  = pinIRQ2Mst;
+
+	regAddr = REG_NULL;
+	_rxCnt = 0;
+
+	bytesWR = bytesRD = 0;
+
+	regIEN = 0;
+}
+
+// set ID & name
+const uint16_t SPISlave_::ID = DEV_ID;
+const char* SPISlave_::Name = "SPI-Slave";
+
+extern "C" u32 SPISlave_IT_HANDLER(void* dummy) {
+	(void)dummy;
+
+	SPISlave.onService();
+	return 0UL;
+}
+
+#define __USI_ENABLE_TX(_dev,_en) \
+	do { \
+	USI_SSI_INTConfig(_dev,	\
+		(USI_TXFIFO_ALMOST_EMTY_INTS | USI_TXFIFO_OVERFLOW_INTS), \
+		_en); \
+	if (!_en) { \
+		for (int i = 0; i < 1000; i++) { \
+			if (! (USI_SPI_SLV_TX_ACTIVITY & USI_SSI_GetTransStatus(udev))) { \
+				break; \
+			} \
+		} \
+	} \
+	USI_SSI_TRxPath_Cmd(udev, USI_SPI_TX_ENABLE, _en); \
+	} while(0)
+
+#define __USI_ENABLE_RX(_dev,_en) \
+	do { \
+	USI_SSI_INTConfig(_dev,	\
+		(USI_RXFIFO_ALMOST_FULL_INTS | USI_RXFIFO_OVERFLOW_INTS | USI_RXFIFO_UNDERFLOW_INTS), \
+		_en); \
+	USI_SSI_TRxPath_Cmd(udev, USI_SPI_RX_ENABLE, _en); \
+	} while(0)
+
 
 void SPISlave_::begin(void) {
-  //Master Mode
-  sercom->initMasterWIRE(TWI_CLOCK);
-  sercom->enableWIRE();
+	/*
+	 * IRQ0 output high level,
+	 * if this/slave have no events
+	 */
+	gpio_init(&irqOut, (PinName)pinIRQ);
+	gpio_write(&irqOut, SPI_SLAVE_IDLE);
+	gpio_mode(&irqOut, PullUp);
+	gpio_dir(&irqOut, PIN_OUTPUT);
 
-  pinPeripheral(_uc_pinSDA, g_APinDescription[_uc_pinSDA].ulPinType);
-  pinPeripheral(_uc_pinSCL, g_APinDescription[_uc_pinSCL].ulPinType);
+	RCC_PeriphClockCmd(APBPeriph_USI_REG, APBPeriph_USI_CLOCK, ENABLE);
+
+	/* slave pinmux */
+	Pinmux_Config(pinMOSI, PINMUX_FUNCTION_SPIS);
+	Pinmux_Config(pinMISO, PINMUX_FUNCTION_SPIS);
+	Pinmux_Config(pinSCLK, PINMUX_FUNCTION_SPIS);
+	Pinmux_Config(pinCS,   PINMUX_FUNCTION_SPIS);
+
+	USI_SSI_StructInitEx(&usIs);
+	usIs.USI_SPI_Role = USI_SPI_SLAVE;
+	/* interrupt when TX FIFO empty through USI_TXFIFO_ALMOST_EMTY_INTS */
+	usIs.USI_SPI_TxThresholdLevel = 0;
+	USI_SSI_InitEx(udev, &usIs);
+
+	irqUsi = USI_DEV_TABLE[0].IrqNum;
+	InterruptRegister((IRQ_FUN)SPISlave_IT_HANDLER, irqUsi, (u32)NULL, 5);
+	InterruptEn(irqUsi, 5);
+
+	if (usIs.USI_SPI_SclkPolarity == SCPOL_INACTIVE_IS_LOW) {
+		PAD_PullCtrl((u32)pinSCLK, GPIO_PuPd_DOWN);
+	} else {
+		PAD_PullCtrl((u32)pinSCLK, GPIO_PuPd_UP);
+	}
+	PAD_PullCtrl((u32)pinCS, GPIO_PuPd_UP);
+
+	__USI_ENABLE_RX(udev, ENABLE);
+	return;
 }
 
-void SPISlave_::begin(uint8_t address, bool enableGeneralCall) {
-  //Slave mode
-  sercom->initSlaveWIRE(address, enableGeneralCall);
-  sercom->enableWIRE();
+void SPISlave_::setDataMode(uint8_t dataMode) {
+	u32   SclkPhase;
+	u32   SclkPolarity;
 
-  pinPeripheral(_uc_pinSDA, g_APinDescription[_uc_pinSDA].ulPinType);
-  pinPeripheral(_uc_pinSCL, g_APinDescription[_uc_pinSCL].ulPinType);
-}
+	/*
+	* mode | POL PHA
+	* -----+--------
+	*   0  |  0   0
+	*   1  |  0   1
+	*   2  |  1   0
+	*   3  |  1   1
+	*
+	* SCPOL_INACTIVE_IS_LOW  = 0,
+	* SCPOL_INACTIVE_IS_HIGH = 1
+	*
+	* SCPH_TOGGLES_IN_MIDDLE = 0,
+	* SCPH_TOGGLES_AT_START  = 1
+	*/
+	switch (dataMode) {
+	case SPI_MODE0:
+		SclkPolarity = SCPOL_INACTIVE_IS_LOW;
+		SclkPhase    = SCPH_TOGGLES_IN_MIDDLE;
+		break;
+	case SPI_MODE1:
+		SclkPolarity = SCPOL_INACTIVE_IS_LOW;
+		SclkPhase    = SCPH_TOGGLES_AT_START;
+		break;
+	case SPI_MODE2:
+		SclkPolarity = SCPOL_INACTIVE_IS_HIGH;
+		SclkPhase    = SCPH_TOGGLES_IN_MIDDLE;
+		break;
+	case SPI_MODE3:
+	default:  // same as 3
+		SclkPolarity = SCPOL_INACTIVE_IS_HIGH;
+		SclkPhase    = SCPH_TOGGLES_AT_START;
+		break;
+	}
 
-void SPISlave_::setClock(uint32_t baudrate) {
-  sercom->disableWIRE();
-  sercom->initMasterWIRE(baudrate);
-  sercom->enableWIRE();
+	USI_SSI_SetSclkPhase(udev, SclkPhase);
+	USI_SSI_SetSclkPolarity(udev, SclkPolarity);
+	USI_SSI_SetDataFrameSize(udev, USI_SPI_DFS_8_BITS);
+
+	if (SclkPolarity == SCPOL_INACTIVE_IS_LOW) {
+		PAD_PullCtrl((u32)pinSCLK, GPIO_PuPd_DOWN);
+	} else {
+		PAD_PullCtrl((u32)pinSCLK, GPIO_PuPd_UP);
+	}
+	PAD_PullCtrl((u32)pinCS, GPIO_PuPd_UP);
+
+	usIs.USI_SPI_SclkPhase = SclkPhase;
+	usIs.USI_SPI_SclkPolarity = SclkPolarity;
+	return;
 }
 
 void SPISlave_::end() {
-  sercom->disableWIRE();
-}
-
-uint8_t SPISlave_::requestFrom(uint8_t address, size_t quantity, bool stopBit)
-{
-  if(quantity == 0)
-  {
-    return 0;
-  }
-
-  size_t byteRead = 0;
-
-  rxBuffer.clear();
-
-  if(sercom->startTransmissionWIRE(address, WIRE_READ_FLAG))
-  {
-    // Read first data
-    rxBuffer.store_char(sercom->readDataWIRE());
-
-    // Connected to slave
-    for (byteRead = 1; byteRead < quantity; ++byteRead)
-    {
-      sercom->prepareAckBitWIRE();                          // Prepare Acknowledge
-      sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_READ); // Prepare the ACK command for the slave
-      rxBuffer.store_char(sercom->readDataWIRE());          // Read data and send the ACK
-    }
-    sercom->prepareNackBitWIRE();                           // Prepare NACK to stop slave transmission
-    //sercom->readDataWIRE();                               // Clear data register to send NACK
-
-    if (stopBit)
-    {
-      sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);   // Send Stop
-    }
-  }
-
-  return byteRead;
-}
-
-uint8_t SPISlave_::requestFrom(uint8_t address, size_t quantity)
-{
-  return requestFrom(address, quantity, true);
-}
-
-void SPISlave_::beginTransmission(uint8_t address) {
-  // save address of target and clear buffer
-  txAddress = address;
-  txBuffer.clear();
-
-  transmissionBegun = true;
-}
-
-// Errors:
-//  0 : Success
-//  1 : Data too long
-//  2 : NACK on transmit of address
-//  3 : NACK on transmit of data
-//  4 : Other error
-uint8_t SPISlave_::endTransmission(bool stopBit)
-{
-  transmissionBegun = false ;
-
-  // Start I2C transmission
-  if ( !sercom->startTransmissionWIRE( txAddress, WIRE_WRITE_FLAG ) )
-  {
-    sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
-    return 2 ;  // Address error
-  }
-
-  // Send all buffer
-  while( txBuffer.available() )
-  {
-    // Trying to send data
-    if ( !sercom->sendDataMasterWIRE( txBuffer.read_char() ) )
-    {
-      sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
-      return 3 ;  // Nack or error
-    }
-  }
-  
-  if (stopBit)
-  {
-    sercom->prepareCommandBitsWire(WIRE_MASTER_ACT_STOP);
-  }   
-
-  return 0;
-}
-
-uint8_t SPISlave_::endTransmission()
-{
-  return endTransmission(true);
+	txBuffer.clear();
+	rxBuffer.clear();
 }
 
 size_t SPISlave_::write(uint8_t ucData)
 {
-  // No writing, without begun transmission or a full buffer
-  if ( !transmissionBegun || txBuffer.isFull() )
-  {
-    return 0 ;
-  }
+	// No writing, without a full buffer
+	if (txBuffer.isFull()) {
+		return 0 ;
+	}
 
-  txBuffer.store_char( ucData ) ;
-
-  return 1 ;
+	txBuffer.store_char( ucData );
+	return 1 ;
 }
 
-size_t SPISlave_::write(const uint8_t *data, size_t quantity)
-{
-  //Try to store all data
-  for(size_t i = 0; i < quantity; ++i)
-  {
-    //Return the number of data stored, when the buffer is full (if write return 0)
-    if(!write(data[i]))
-      return i;
-  }
+size_t SPISlave_::write(const uint8_t * data, size_t quantity) {
+	// Try to store all data
+	for (size_t i = 0; i < quantity; ++i) {
+		// Return the number of data stored,
+		// when the buffer is full (if write return 0)
+		if(!write(data[i]))
+			return i;
+	}
 
-  //All data stored
-  return quantity;
+	// All data stored
+	return quantity;
 }
 
 int SPISlave_::available(void)
 {
-  return rxBuffer.available();
+	return rxBuffer.available();
 }
 
 int SPISlave_::read(void)
 {
-  return rxBuffer.read_char();
+	return rxBuffer.read_char();
 }
 
 int SPISlave_::peek(void)
 {
-  return rxBuffer.peek();
+	return rxBuffer.peek();
 }
 
 void SPISlave_::flush(void)
 {
-  // Do nothing, use endTransmission(..) to force
-  // data transfer.
 }
 
 void SPISlave_::onReceive(void(*function)(int))
 {
-  onReceiveCallback = function;
+	onReceiveCallback = function;
 }
 
-void SPISlave_::onRequest(void(*function)(void))
+void SPISlave_::onRequest(void(*function)(int))
 {
-  onRequestCallback = function;
+	onRequestCallback = function;
+}
+
+
+
+/* --------------------------------------- private implementation ----------------------------------------------- */
+
+/* Directly write to SPI controller TX FIFO */
+size_t SPISlave_::_write(const uint8_t *data, size_t quantity) {
+	size_t i;
+
+	for (i = 0; i < quantity; ++i) {
+		// Return the number of data stored
+		// when the buffer is full (if write return 0)
+		if (!USI_SSI_Writeable(udev)) {
+			break;
+		}
+		USI_SSI_WriteData(udev, data[i]);
+	}
+
+	//All data stored
+	return i;
+}
+
+size_t SPISlave_::_writeFromTxBuf(int max_bytes) {
+	uint8_t c;
+	int s;
+
+	for (s = max_bytes; s > 0;) {
+		if (USI_SSI_Writeable(udev) && txBuffer.available()) {
+			c = txBuffer.read_char();
+			USI_SSI_WriteData(udev, c);
+			s--;
+		} else {
+			break;
+		}
+	}
+	return max_bytes - s;
+}
+
+void SPISlave_::_regRD(void) {
+	static const char* name = "";
+	uint16_t v;
+	int av;
+
+	__USI_ENABLE_TX(udev, ENABLE);
+	__USI_ENABLE_RX(udev, DISABLE);
+
+	switch (regAddr) {
+	case REG_ID:
+		_write((uint8_t*)&ID, sizeof ID);
+		break;
+
+	case REG_VER:
+		_write((uint8_t*)&DEV_VER, sizeof DEV_VER);
+		break;
+
+	case REG_NAME:
+		v = (*name) & 0xFF;
+		_write((uint8_t*)&v, sizeof v);
+
+		if (!v) {
+			name = Name;
+		} else {
+			name++;
+		}
+		break;
+
+	case REG_IEN:
+		v = regIEN;
+		_write((uint8_t*)&v, sizeof v);
+		break;
+
+	case REG_RLEN:
+		av = txBuffer.available();
+		v = (av > 0xFFFF)? 0xFFFF: av;
+		_write((uint8_t*)&v, sizeof v);
+		break;
+
+	case REG_WLEN:
+		av = rxBuffer.availableForStore();
+		v = (av > 0xFFFF)? 0xFFFF: av;
+		_write((uint8_t*)&v, sizeof v);
+		break;
+
+	default:
+		v = 0;
+		_write((uint8_t*)&v, sizeof(v));
+		break;
+	}
+
+	#if 0
+	regAddr = REG_NULL;
+	#else
+	// continuous reading is allowed
+	#endif
+	return;
+}
+
+void SPISlave_::_regWR(void) {
+	uint16_t v;
+	uint32_t ack;
+
+	v = 0;
+	v |= (_rxBuf[1] << 0);
+	v |= (_rxBuf[2] << 8);
+
+	if (regAddr == REG_NULL) {
+		return;
+	}
+
+	switch (regAddr & REG_MASK) {
+	case REG_IEN:
+		regIEN = v;
+		break;
+
+	case REG_RLEN:
+		bytesRD = v;
+		ack = RDATA_ACK << 8;
+		_write((uint8_t*)&ack, 3);
+		break;
+
+	case REG_WLEN:
+		bytesWR = v;
+		ack = WDATA_ACK << 8;
+		_write((uint8_t*)&ack, 3);
+		break;
+
+	case REG_RDATA:
+		if (v != bytesRD) {
+			printf("USI Usage #1\n");
+			return;
+		}
+		/* transfer data from slave to master */
+		__USI_ENABLE_RX(udev, DISABLE);
+		__USI_ENABLE_TX(udev, ENABLE);
+		if (bytesRD > USI_SPI_TX_FIFO_DEPTH) {
+			USI_SSI_SetTxFifoLevel(udev, USI_SPI_TX_FIFO_DEPTH / 2);
+		} else {
+			USI_SSI_SetTxFifoLevel(udev, 0);
+		}
+		break;
+
+	case REG_WDATA:
+		if (v != bytesWR) {
+			printf("USI Usage #2\n");
+			return;
+		}
+		/* transfer data from master to slave */
+		if (bytesWR > USI_SPI_RX_FIFO_DEPTH) {
+			USI_SSI_SetRxFifoLevel(udev, USI_SPI_RX_FIFO_DEPTH / 2);
+		} else {
+			USI_SSI_SetRxFifoLevel(udev, bytesWR - 1);
+		}
+		break;
+
+	default:
+		break;
+	}
+
+	return;
+}
+
+void SPISlave_::_recv(void) {
+	uint8_t c;
+	int i;
+
+	for (i = _rxCnt; USI_SSI_Readable(udev);) {
+		c = USI_SSI_ReadData(udev);
+		if ((unsigned)i >= sizeof _rxBuf) {
+			continue;
+		}
+		_rxBuf[i++] = c;
+	}
+	_rxCnt = i;
+
+	/*
+	 * In RX transfer, all _rxBuf element are DATA
+	 */
+	if (regAddr == (REG_WDATA | TAG_WRITE)) {
+		for (i = 0; i < _rxCnt; i++) {
+			if (!rxBuffer.isFull()) {
+				rxBuffer.store_char(_rxBuf[i]);
+			} else {
+				printf("URX Bug #2\n");
+			}
+			if (--bytesWR <= 0) {
+				break;
+			}
+		}
+
+		if (bytesWR <= 0) {
+			regAddr = REG_NULL;
+			USI_SSI_SetRxFifoLevel(udev, 0);
+		} else
+		if (bytesWR <= USI_SPI_RX_FIFO_DEPTH) {
+			USI_SSI_SetRxFifoLevel(udev, bytesWR - 1);
+		}
+
+		_rxCnt = 0;
+		return;
+	}
+
+	regAddr = _rxBuf[0];
+	if ((regAddr & REG_MASK) >= REG_CNT) {
+		regAddr = REG_NULL;
+	}
+
+	if (regAddr & TAG_WRITE) {
+		if (_rxCnt < 3) {
+			/* insufficient bytes to write register */
+			return;
+		}
+		_regWR();
+		if (_rxCnt > 3) {
+			printf("URX WRN#1\n");
+		}
+	} else {
+		_regRD();
+		if (_rxCnt > 1) {
+			printf("URX WRN#2\n");
+		}
+	}
+
+	#if 0
+	for (i = 0; i < _rxCnt; i++)
+		printf("%02X ", _rxBuf[i]);
+	printf("\n");
+	#endif
+
+	_rxCnt = 0;
+	return;
 }
 
 void SPISlave_::onService(void)
 {
-  if ( sercom->isSlaveWIRE() )
-  {
-    if(sercom->isStopDetectedWIRE() || 
-        (sercom->isAddressMatch() && sercom->isRestartDetectedWIRE() && !sercom->isMasterReadOperationWIRE())) //Stop or Restart detected
-    {
-      sercom->prepareAckBitWIRE();
-      sercom->prepareCommandBitsWire(0x03);
+	u32 status = USI_SSI_GetIsr(udev);
 
-      //Calling onReceiveCallback, if exists
-      if(onReceiveCallback)
-      {
-        onReceiveCallback(available());
-      }
-      
-      rxBuffer.clear();
-    }
-    else if(sercom->isAddressMatch())  //Address Match
-    {
-      sercom->prepareAckBitWIRE();
-      sercom->prepareCommandBitsWire(0x03);
+	USI_SSI_SetIsrClean(udev, status);
 
-      if(sercom->isMasterReadOperationWIRE()) //Is a request ?
-      {
-        txBuffer.clear();
+	if (status &
+	(USI_TXFIFO_OVERFLOW_INTS | USI_TXFIFO_UNDERFLOW_INTS |
+	 USI_RXFIFO_OVERFLOW_INTS | USI_RXFIFO_UNDERFLOW_INTS |
+	 USI_SPI_RX_DATA_FRM_ERR_INTS)
+	) {
+		printf("[INT] Tx/Rx Warning %x\n", (unsigned)status);
+	}
 
-        transmissionBegun = true;
+	if ((status & USI_RXFIFO_ALMOST_FULL_INTS)) {
+		if (!USI_SSI_Readable(udev)) {
+			printf("URX Bug #1\n");
+		}
 
-        //Calling onRequestCallback, if exists
-        if(onRequestCallback)
-        {
-          onRequestCallback();
-        }
-      }
-    }
-    else if(sercom->isDataReadyWIRE())
-    {
-      if (sercom->isMasterReadOperationWIRE())
-      {
-        uint8_t c = 0xff;
+		_recv();
 
-        if( txBuffer.available() ) {
-          c = txBuffer.read_char();
-        }
+		// Calling onReceiveCallback, if exists
+		if (onReceiveCallback && rxBuffer.available()) {
+			onReceiveCallback(rxBuffer.available());
+		}
+	}
 
-        transmissionBegun = sercom->sendDataSlaveWIRE(c);
-      } else { //Received data
-        if (rxBuffer.isFull()) {
-          sercom->prepareNackBitWIRE(); 
-        } else {
-          //Store data
-          rxBuffer.store_char(sercom->readDataWIRE());
+	if (status & USI_TXFIFO_ALMOST_EMTY_INTS) {
+		if (regAddr != (REG_RDATA | TAG_WRITE)) {
+			/* transfer limit register content complete */
+			__USI_ENABLE_TX(udev, DISABLE);
+			__USI_ENABLE_RX(udev, ENABLE);
+		} else if (bytesRD <= 0) {
+			/* TX transfer complete */
+			__USI_ENABLE_TX(udev, DISABLE);
+			__USI_ENABLE_RX(udev, ENABLE);
+			regAddr = REG_NULL;
+			bytesRD = 0;
 
-          sercom->prepareAckBitWIRE(); 
-        }
-
-        sercom->prepareCommandBitsWire(0x03);
-      }
-    }
-  }
+			// Calling onRequestCallback, if exists
+			if (onRequestCallback) {
+				onRequestCallback(txBuffer.availableForStore());
+			}
+		} else {
+			/* TX transfer in progress */
+			bytesRD -= _writeFromTxBuf(bytesRD);
+			if (bytesRD <= 0) {
+				USI_SSI_SetTxFifoLevel(udev, 0);
+			}
+		}
+	}
 }
 
-#if WIRE_INTERFACES_COUNT > 0
-  /* In case new variant doesn't define these macros,
-   * we put here the ones for Arduino Zero.
-   *
-   * These values should be different on some variants!
-   */
-  #ifndef PERIPH_WIRE
-    #define PERIPH_WIRE          sercom3
-    #define WIRE_IT_HANDLER      SERCOM3_Handler
-  #endif // PERIPH_WIRE
-  SPISlave_ Wire(&PERIPH_WIRE, PIN_WIRE_SDA, PIN_WIRE_SCL);
-
-  void WIRE_IT_HANDLER(void) {
-    Wire.onService();
-  }
-#endif
-
-#if WIRE_INTERFACES_COUNT > 1
-  SPISlave_ Wire1(&PERIPH_WIRE1, PIN_WIRE1_SDA, PIN_WIRE1_SCL);
-
-  void WIRE1_IT_HANDLER(void) {
-    Wire1.onService();
-  }
-#endif
-
-#if WIRE_INTERFACES_COUNT > 2
-  SPISlave_ Wire2(&PERIPH_WIRE2, PIN_WIRE2_SDA, PIN_WIRE2_SCL);
-
-  void WIRE2_IT_HANDLER(void) {
-    Wire2.onService();
-  }
-#endif
-
-#if WIRE_INTERFACES_COUNT > 3
-  SPISlave_ Wire3(&PERIPH_WIRE3, PIN_WIRE3_SDA, PIN_WIRE3_SCL);
-
-  void WIRE3_IT_HANDLER(void) {
-    Wire3.onService();
-  }
-#endif
-
-#if WIRE_INTERFACES_COUNT > 4
-  SPISlave_ Wire4(&PERIPH_WIRE4, PIN_WIRE4_SDA, PIN_WIRE4_SCL);
-
-  void WIRE4_IT_HANDLER(void) {
-    Wire4.onService();
-  }
-#endif
-
-#if WIRE_INTERFACES_COUNT > 5
-  SPISlave_ Wire5(&PERIPH_WIRE5, PIN_WIRE5_SDA, PIN_WIRE5_SCL);
-
-  void WIRE5_IT_HANDLER(void) {
-    Wire5.onService();
-  }
-#endif
-
+SPISlave_ SPISlave(USI0_DEV, USI_SPI_MOSI, USI_SPI_MISO, USI_SPI_SCLK, USI_SPI_CS, RTL87XX_IRQ0);

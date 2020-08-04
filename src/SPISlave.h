@@ -20,10 +20,12 @@
 #ifndef __SPISLAVE_H__
 #define __SPISLAVE_H__
 
+extern "C" {
+#include "ameba_soc.h"
+#include "gpio_api.h"
+}
 #include "Stream.h"
 #include "variant.h"
-
-#include "SERCOM.h"
 #include "RingBuffer.h"
 
  // WIRE_HAS_END means Wire has end()
@@ -32,18 +34,13 @@
 class SPISlave_ : public Stream
 {
   public:
-    SPISlave_(SERCOM *s, uint8_t pinSDA, uint8_t pinSCL);
+    SPISlave_(USI_TypeDef* udev, int pinMOSI, int pinMISO, int pinSCLK, int pinCS, int pinIRQ2Mst);
     void begin();
-    void begin(uint8_t, bool enableGeneralCall = false);
     void end();
-    void setClock(uint32_t);
 
-    void beginTransmission(uint8_t);
-    uint8_t endTransmission(bool stopBit);
-    uint8_t endTransmission(void);
-
-    uint8_t requestFrom(uint8_t address, size_t quantity, bool stopBit);
-    uint8_t requestFrom(uint8_t address, size_t quantity);
+    void setBitOrder(BitOrder order) { (void)order; }
+    void setDataMode(uint8_t dataMode);
+    void setClockDivider(uint8_t uc_div) { (void)uc_div;}
 
     size_t write(uint8_t data);
     size_t write(const uint8_t * data, size_t quantity);
@@ -53,7 +50,7 @@ class SPISlave_ : public Stream
     virtual int peek(void);
     virtual void flush(void);
     void onReceive(void(*)(int));
-    void onRequest(void(*)(void));
+    void onRequest(void(*)(int));
 
     inline size_t write(unsigned long n) { return write((uint8_t)n); }
     inline size_t write(long n) { return write((uint8_t)n); }
@@ -64,25 +61,46 @@ class SPISlave_ : public Stream
     void onService(void);
 
   private:
-    SERCOM * sercom;
-    uint8_t _uc_pinSDA;
-    uint8_t _uc_pinSCL;
+    USI_TypeDef* udev;
+    USI_SSI_InitTypeDef usIs;
+    uint8_t pinMOSI;
+    uint8_t pinMISO;
+    uint8_t pinSCLK;
+    uint8_t pinCS;
+    int     pinIRQ;
 
-    bool transmissionBegun;
+    int irqUsi; /* USI irq for MCU interrupt */
+
+    gpio_t irqOut; /* gpio irq to MASTER device */
 
     // RX Buffer
-    RingBufferN<256> rxBuffer;
+    RingBufferN<SERIAL_BUFFER_SIZE> rxBuffer;
 
-    //TX buffer
-    RingBufferN<256> txBuffer;
-    uint8_t txAddress;
+    // TX buffer
+    RingBufferN<SERIAL_BUFFER_SIZE> txBuffer;
 
     // Callback user functions
-    void (*onRequestCallback)(void);
+    void (*onRequestCallback)(int);
     void (*onReceiveCallback)(int);
 
-    // TWI clock frequency
-    static const uint32_t TWI_CLOCK = 100000;
+    volatile int bytesRD, bytesWR;
+    void _recv(void);
+    void _regRD(void);
+    void _regWR(void);
+
+    // Directly write to SPI Controller TX FIFO
+    size_t _write(const uint8_t * data, size_t quantity);
+    size_t _writeFromTxBuf(int max_bytes);
+
+    // small buffer for register access
+    uint8_t _rxBuf[USI_SPI_RX_FIFO_DEPTH];
+    volatile int _rxCnt;
+    volatile uint8_t regAddr;
+    // Interrupt ENable
+    volatile uint16_t regIEN;
+
+    static const uint16_t ID;
+    static const char* Name;
 };
 
 extern SPISlave_ SPISlave;
