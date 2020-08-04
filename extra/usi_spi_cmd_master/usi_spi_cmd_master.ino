@@ -24,7 +24,26 @@ enum {
 	SPT_TAG_DMY = 0xFF, /* dummy */
 };
 
-const int _WAIT_SLAVE_READY_US = 0;
+enum {
+	USPI_REG_DMY  = 0x00, /* rw */
+	USPI_REG_ID,          /* ro */
+	USPI_REG_VER,         /* ro */
+	USPI_REG_NAME,        /* ro */
+	USPI_REG_CTRL,        /* rw */
+	USPI_REG_STS,         /* ro */
+	USPI_REG_IEN,         /* rw */
+	#define IEN_TX 0x0001     // have data to master
+	#define IEN_RX 0x0002     // have space could receive from master
+	USPI_REG_IRQ,         /* r1c */
+	USPI_REG_RLEN  = 0x10,/* rw */
+	USPI_REG_WLEN,        /* rw */
+	USPI_REG_RDATA = 0x20,/* wo */
+	USPI_REG_WDATA,       /* wo */
+	USPI_REG_CNT,
+};
+
+/* No less than 60 us between REG byte and VALUE bytes. */
+const int _WAIT_SLAVE_READY_US = 100;
 
 enum {
 	SPT_ERR_OK  = 0x00,
@@ -46,8 +65,30 @@ int spi_transfer_cs(uint8_t v) {
 int spi_transfer16_cs(uint16_t v) {
   uint16_t r;
 
-  r  = spi_transfer_cs(v >> 8) << 8;
-  r |= spi_transfer_cs(v & 0xFF);
+  // take the chip select low to select the device
+  digitalWrite(chipSelectPin, LOW);
+
+  r  = 0;
+  r |= SPIX.transfer(v & 0xFF);
+  r |= SPIX.transfer(v >> 8) << 8;
+
+  // take the chip select high to de-select
+  digitalWrite(chipSelectPin, HIGH);
+  return r;
+}
+
+static unsigned uspi_rd_reg(int reg) {
+  spi_transfer_cs(SPT_TAG_RD | reg);
+  delayMicroseconds(_WAIT_SLAVE_READY_US);
+  return spi_transfer16_cs((SPT_TAG_DMY << 8) | SPT_TAG_DMY);
+}
+
+static int uspi_wr_reg(int reg, unsigned val) {
+  int r;
+
+  spi_transfer_cs(SPT_TAG_WR | reg);
+  r = spi_transfer16_cs(val);
+  // delayMicroseconds(_WAIT_SLAVE_READY_US);
   return r;
 }
 
@@ -122,7 +163,6 @@ int at_cmd_read(uint8_t* buf, uint16_t len, int loop_wait = 50) {
   spi_transfer16_cs((SPT_TAG_PRE << 8) | SPT_TAG_RD);
   spi_transfer16_cs(len);
 
-
   /* wait slave ready to transfer data */
   at_wait_io(SPI_STATE_MISO);
   v = spi_transfer_cs(SPT_TAG_DMY);
@@ -191,6 +231,26 @@ void setup() {
   // give the slave time to set up
   delay(50);
   pinMode(PIN_SERIAL2_RX, INPUT);
+
+  delay(2000);
+
+  char idstr[0x20];
+  uint16_t id;
+
+  id = uspi_rd_reg(USPI_REG_ID);
+  sprintf(idstr, "Slave ID  = %04X", id);
+  Serial.println(idstr);
+
+  id = uspi_rd_reg(USPI_REG_VER);
+  sprintf(idstr, "Slave VER = %d.%d", id >> 8, id & 0xFF);
+  Serial.println(idstr);
+
+  uspi_wr_reg(USPI_REG_IEN, IEN_TX | IEN_RX);
+  id = uspi_rd_reg(USPI_REG_IEN);
+  sprintf(idstr, "Slave IEN = %04X", id);
+  Serial.println(idstr);
+
+  delay(100);
 
   Serial.println("Ready! Enter some AT commands");
 
