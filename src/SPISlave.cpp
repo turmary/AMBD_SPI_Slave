@@ -1,6 +1,6 @@
 /*
- * TWI/I2C library for Arduino Zero
- * Copyright (c) 2015 Arduino LLC. All rights reserved.
+ * SPI Slave library for AMBD Arduino
+ * Copyright (c) 2020 Seeed Studio. All rights reserved.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -24,9 +24,9 @@ extern "C" {
 #include <Arduino.h>
 #include <wiring_private.h>
 
-#include "Wire.h"
+#include "SPISlave.h"
 
-TwoWire::TwoWire(SERCOM * s, uint8_t pinSDA, uint8_t pinSCL)
+SPISlave_::SPISlave_(SERCOM * s, uint8_t pinSDA, uint8_t pinSCL)
 {
   this->sercom = s;
   this->_uc_pinSDA=pinSDA;
@@ -34,7 +34,7 @@ TwoWire::TwoWire(SERCOM * s, uint8_t pinSDA, uint8_t pinSCL)
   transmissionBegun = false;
 }
 
-void TwoWire::begin(void) {
+void SPISlave_::begin(void) {
   //Master Mode
   sercom->initMasterWIRE(TWI_CLOCK);
   sercom->enableWIRE();
@@ -43,7 +43,7 @@ void TwoWire::begin(void) {
   pinPeripheral(_uc_pinSCL, g_APinDescription[_uc_pinSCL].ulPinType);
 }
 
-void TwoWire::begin(uint8_t address, bool enableGeneralCall) {
+void SPISlave_::begin(uint8_t address, bool enableGeneralCall) {
   //Slave mode
   sercom->initSlaveWIRE(address, enableGeneralCall);
   sercom->enableWIRE();
@@ -52,17 +52,17 @@ void TwoWire::begin(uint8_t address, bool enableGeneralCall) {
   pinPeripheral(_uc_pinSCL, g_APinDescription[_uc_pinSCL].ulPinType);
 }
 
-void TwoWire::setClock(uint32_t baudrate) {
+void SPISlave_::setClock(uint32_t baudrate) {
   sercom->disableWIRE();
   sercom->initMasterWIRE(baudrate);
   sercom->enableWIRE();
 }
 
-void TwoWire::end() {
+void SPISlave_::end() {
   sercom->disableWIRE();
 }
 
-uint8_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
+uint8_t SPISlave_::requestFrom(uint8_t address, size_t quantity, bool stopBit)
 {
   if(quantity == 0)
   {
@@ -97,12 +97,12 @@ uint8_t TwoWire::requestFrom(uint8_t address, size_t quantity, bool stopBit)
   return byteRead;
 }
 
-uint8_t TwoWire::requestFrom(uint8_t address, size_t quantity)
+uint8_t SPISlave_::requestFrom(uint8_t address, size_t quantity)
 {
   return requestFrom(address, quantity, true);
 }
 
-void TwoWire::beginTransmission(uint8_t address) {
+void SPISlave_::beginTransmission(uint8_t address) {
   // save address of target and clear buffer
   txAddress = address;
   txBuffer.clear();
@@ -116,7 +116,7 @@ void TwoWire::beginTransmission(uint8_t address) {
 //  2 : NACK on transmit of address
 //  3 : NACK on transmit of data
 //  4 : Other error
-uint8_t TwoWire::endTransmission(bool stopBit)
+uint8_t SPISlave_::endTransmission(bool stopBit)
 {
   transmissionBegun = false ;
 
@@ -146,12 +146,12 @@ uint8_t TwoWire::endTransmission(bool stopBit)
   return 0;
 }
 
-uint8_t TwoWire::endTransmission()
+uint8_t SPISlave_::endTransmission()
 {
   return endTransmission(true);
 }
 
-size_t TwoWire::write(uint8_t ucData)
+size_t SPISlave_::write(uint8_t ucData)
 {
   // No writing, without begun transmission or a full buffer
   if ( !transmissionBegun || txBuffer.isFull() )
@@ -164,7 +164,7 @@ size_t TwoWire::write(uint8_t ucData)
   return 1 ;
 }
 
-size_t TwoWire::write(const uint8_t *data, size_t quantity)
+size_t SPISlave_::write(const uint8_t *data, size_t quantity)
 {
   //Try to store all data
   for(size_t i = 0; i < quantity; ++i)
@@ -178,38 +178,38 @@ size_t TwoWire::write(const uint8_t *data, size_t quantity)
   return quantity;
 }
 
-int TwoWire::available(void)
+int SPISlave_::available(void)
 {
   return rxBuffer.available();
 }
 
-int TwoWire::read(void)
+int SPISlave_::read(void)
 {
   return rxBuffer.read_char();
 }
 
-int TwoWire::peek(void)
+int SPISlave_::peek(void)
 {
   return rxBuffer.peek();
 }
 
-void TwoWire::flush(void)
+void SPISlave_::flush(void)
 {
   // Do nothing, use endTransmission(..) to force
   // data transfer.
 }
 
-void TwoWire::onReceive(void(*function)(int))
+void SPISlave_::onReceive(void(*function)(int))
 {
   onReceiveCallback = function;
 }
 
-void TwoWire::onRequest(void(*function)(void))
+void SPISlave_::onRequest(void(*function)(void))
 {
   onRequestCallback = function;
 }
 
-void TwoWire::onService(void)
+void SPISlave_::onService(void)
 {
   if ( sercom->isSlaveWIRE() )
   {
@@ -282,7 +282,7 @@ void TwoWire::onService(void)
     #define PERIPH_WIRE          sercom3
     #define WIRE_IT_HANDLER      SERCOM3_Handler
   #endif // PERIPH_WIRE
-  TwoWire Wire(&PERIPH_WIRE, PIN_WIRE_SDA, PIN_WIRE_SCL);
+  SPISlave_ Wire(&PERIPH_WIRE, PIN_WIRE_SDA, PIN_WIRE_SCL);
 
   void WIRE_IT_HANDLER(void) {
     Wire.onService();
@@ -290,7 +290,7 @@ void TwoWire::onService(void)
 #endif
 
 #if WIRE_INTERFACES_COUNT > 1
-  TwoWire Wire1(&PERIPH_WIRE1, PIN_WIRE1_SDA, PIN_WIRE1_SCL);
+  SPISlave_ Wire1(&PERIPH_WIRE1, PIN_WIRE1_SDA, PIN_WIRE1_SCL);
 
   void WIRE1_IT_HANDLER(void) {
     Wire1.onService();
@@ -298,7 +298,7 @@ void TwoWire::onService(void)
 #endif
 
 #if WIRE_INTERFACES_COUNT > 2
-  TwoWire Wire2(&PERIPH_WIRE2, PIN_WIRE2_SDA, PIN_WIRE2_SCL);
+  SPISlave_ Wire2(&PERIPH_WIRE2, PIN_WIRE2_SDA, PIN_WIRE2_SCL);
 
   void WIRE2_IT_HANDLER(void) {
     Wire2.onService();
@@ -306,7 +306,7 @@ void TwoWire::onService(void)
 #endif
 
 #if WIRE_INTERFACES_COUNT > 3
-  TwoWire Wire3(&PERIPH_WIRE3, PIN_WIRE3_SDA, PIN_WIRE3_SCL);
+  SPISlave_ Wire3(&PERIPH_WIRE3, PIN_WIRE3_SDA, PIN_WIRE3_SCL);
 
   void WIRE3_IT_HANDLER(void) {
     Wire3.onService();
@@ -314,7 +314,7 @@ void TwoWire::onService(void)
 #endif
 
 #if WIRE_INTERFACES_COUNT > 4
-  TwoWire Wire4(&PERIPH_WIRE4, PIN_WIRE4_SDA, PIN_WIRE4_SCL);
+  SPISlave_ Wire4(&PERIPH_WIRE4, PIN_WIRE4_SDA, PIN_WIRE4_SCL);
 
   void WIRE4_IT_HANDLER(void) {
     Wire4.onService();
@@ -322,7 +322,7 @@ void TwoWire::onService(void)
 #endif
 
 #if WIRE_INTERFACES_COUNT > 5
-  TwoWire Wire5(&PERIPH_WIRE5, PIN_WIRE5_SDA, PIN_WIRE5_SCL);
+  SPISlave_ Wire5(&PERIPH_WIRE5, PIN_WIRE5_SDA, PIN_WIRE5_SCL);
 
   void WIRE5_IT_HANDLER(void) {
     Wire5.onService();

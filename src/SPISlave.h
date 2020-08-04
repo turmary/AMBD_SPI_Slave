@@ -1,6 +1,6 @@
 /*
- * TWI/I2C library for Arduino Zero
- * Copyright (c) 2015 Arduino LLC. All rights reserved.
+ * SPI Slave library for AMBD Arduino
+ * Copyright (c) 2020 Seeed Studio. All rights reserved.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
@@ -17,8 +17,8 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
  */
 
-#ifndef TwoWire_h
-#define TwoWire_h
+#ifndef __SPISLAVE_H__
+#define __SPISLAVE_H__
 
 #include "Stream.h"
 #include "variant.h"
@@ -29,10 +29,10 @@
  // WIRE_HAS_END means Wire has end()
 #define WIRE_HAS_END 1
 
-class TwoWire : public Stream
+class SPISlave_ : public Stream
 {
   public:
-    TwoWire(SERCOM *s, uint8_t pinSDA, uint8_t pinSCL);
+    SPISlave_(SERCOM *s, uint8_t pinSDA, uint8_t pinSCL);
     void begin();
     void begin(uint8_t, bool enableGeneralCall = false);
     void end();
@@ -85,23 +85,6 @@ class TwoWire : public Stream
     static const uint32_t TWI_CLOCK = 100000;
 };
 
-#if WIRE_INTERFACES_COUNT > 0
-  extern TwoWire Wire;
-#endif
-#if WIRE_INTERFACES_COUNT > 1
-  extern TwoWire Wire1;
-#endif
-#if WIRE_INTERFACES_COUNT > 2
-  extern TwoWire Wire2;
-#endif
-#if WIRE_INTERFACES_COUNT > 3
-  extern TwoWire Wire3;
-#endif
-#if WIRE_INTERFACES_COUNT > 4
-  extern TwoWire Wire4;
-#endif
-#if WIRE_INTERFACES_COUNT > 5
-  extern TwoWire Wire5;
-#endif
+extern SPISlave_ SPISlave;
 
-#endif
+#endif//__SPISLAVE_H__
