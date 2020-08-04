@@ -93,7 +93,7 @@ SPISlave_::SPISlave_(USI_TypeDef* udev, int pinMOSI, int pinMISO, int pinSCLK, i
 	this->pinIRQ  = pinIRQ2Mst;
 
 	regAddr = REG_NULL;
-	_rxCnt = 0;
+	_rxIdx = _rxCnt = 0;
 
 	bytesWR = bytesRD = 0;
 
@@ -303,7 +303,7 @@ size_t SPISlave_::_write(const uint8_t *data, size_t quantity) {
 		USI_SSI_WriteData(udev, data[i]);
 	}
 
-	//All data stored
+	// data stored
 	return i;
 }
 
@@ -402,12 +402,14 @@ void SPISlave_::_regWR(void) {
 	case REG_RLEN:
 		bytesRD = v;
 		ack = RDATA_ACK << 8;
+		__USI_ENABLE_TX(udev, ENABLE);
 		_write((uint8_t*)&ack, 3);
 		break;
 
 	case REG_WLEN:
 		bytesWR = v;
 		ack = WDATA_ACK << 8;
+		__USI_ENABLE_TX(udev, ENABLE);
 		_write((uint8_t*)&ack, 3);
 		break;
 
@@ -418,7 +420,6 @@ void SPISlave_::_regWR(void) {
 		}
 		/* transfer data from slave to master */
 		__USI_ENABLE_RX(udev, DISABLE);
-		__USI_ENABLE_TX(udev, ENABLE);
 		if (bytesRD > USI_SPI_TX_FIFO_DEPTH) {
 			USI_SSI_SetTxFifoLevel(udev, USI_SPI_TX_FIFO_DEPTH / 2);
 		} else {
@@ -459,11 +460,12 @@ void SPISlave_::_recv(void) {
 	}
 	_rxCnt = i;
 
+__more_bytes:
 	/*
 	 * In RX transfer, all _rxBuf element are DATA
 	 */
 	if (regAddr == (REG_WDATA | TAG_WRITE)) {
-		for (i = 0; i < _rxCnt; i++) {
+		for (i = _rxIdx; i < _rxCnt; i++) {
 			if (!rxBuffer.isFull()) {
 				rxBuffer.store_char(_rxBuf[i]);
 			} else {
@@ -475,15 +477,29 @@ void SPISlave_::_recv(void) {
 		}
 
 		if (bytesWR <= 0) {
+			/* RX transfer complete */
 			regAddr = REG_NULL;
 			USI_SSI_SetRxFifoLevel(udev, 0);
+
+			// Calling onReceiveCallback, if exists
+			if (onReceiveCallback && rxBuffer.available()) {
+				onReceiveCallback(rxBuffer.available());
+			}
 		} else
 		if (bytesWR <= USI_SPI_RX_FIFO_DEPTH) {
 			USI_SSI_SetRxFifoLevel(udev, bytesWR - 1);
 		}
 
-		_rxCnt = 0;
+		_rxIdx = _rxCnt = 0;
 		return;
+	}
+
+	if (_rxBuf[0] & TAG_WRITE) {
+		/* Don't change regAddr */
+		if (_rxCnt < 3) {
+			/* insufficient bytes to write register */
+			return;
+		}
 	}
 
 	regAddr = _rxBuf[0];
@@ -492,13 +508,11 @@ void SPISlave_::_recv(void) {
 	}
 
 	if (regAddr & TAG_WRITE) {
-		if (_rxCnt < 3) {
-			/* insufficient bytes to write register */
-			return;
-		}
 		_regWR();
 		if (_rxCnt > 3) {
 			printf("URX WRN#1\n");
+			_rxIdx = 2;
+			goto __more_bytes;
 		}
 	} else {
 		_regRD();
@@ -513,7 +527,7 @@ void SPISlave_::_recv(void) {
 	printf("\n");
 	#endif
 
-	_rxCnt = 0;
+	_rxIdx = _rxCnt = 0;
 	return;
 }
 
@@ -528,7 +542,7 @@ void SPISlave_::onService(void)
 	 USI_RXFIFO_OVERFLOW_INTS | USI_RXFIFO_UNDERFLOW_INTS |
 	 USI_SPI_RX_DATA_FRM_ERR_INTS)
 	) {
-		printf("[INT] Tx/Rx Warning %x\n", (unsigned)status);
+		printf("*BugST=%x\n", (unsigned)status);
 	}
 
 	if ((status & USI_RXFIFO_ALMOST_FULL_INTS)) {
@@ -537,11 +551,6 @@ void SPISlave_::onService(void)
 		}
 
 		_recv();
-
-		// Calling onReceiveCallback, if exists
-		if (onReceiveCallback && rxBuffer.available()) {
-			onReceiveCallback(rxBuffer.available());
-		}
 	}
 
 	if (status & USI_TXFIFO_ALMOST_EMTY_INTS) {

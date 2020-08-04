@@ -94,6 +94,7 @@ class SPISlave_ : public Stream
 
     // small buffer for register access
     uint8_t _rxBuf[USI_SPI_RX_FIFO_DEPTH];
+    volatile int _rxIdx;
     volatile int _rxCnt;
     volatile uint8_t regAddr;
     // Interrupt ENable
