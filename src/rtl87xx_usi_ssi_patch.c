@@ -22,6 +22,7 @@
   * possession or use of this module requires written permission of RealTek.
   *
   * Copyright(c) 2016, Realtek Semiconductor Corporation. All rights reserved.
+  * Copyright(c) 2020, Seeed Technology Co.,Ltd. All rights reserved.
   ****************************************************************************** 
   */
 
@@ -71,22 +72,22 @@
   * @retval None
   */
 void
-USI_SSI_StructInit(USI_SSI_InitTypeDef* USI_SSI_InitStruct)
+USI_SSI_StructInitEx(USI_SSI_InitTypeDef* USI_SSI_InitStruct)
 {
-	USI_SSI_InitStruct->USI_SPI_RxThresholdLevel  =    0;  // if number of entries in the RX FIFO >= RxThresholdLevel + 1, RX interrupt asserted
-	USI_SSI_InitStruct->USI_SPI_TxThresholdLevel  =    32;  // if number of empty entries in th TX FIFO >= TxThresholdLevel, TX interrupt asserted
-	USI_SSI_InitStruct->USI_SPI_DmaRxDataLevel   =      3;
-	USI_SSI_InitStruct->USI_SPI_DmaTxDataLevel   =    56;
+	USI_SSI_InitStruct->USI_SPI_RxThresholdLevel  = 0;   // if number of entries in the RX FIFO  > RxThresholdLevel, RX interrupt asserted
+	USI_SSI_InitStruct->USI_SPI_TxThresholdLevel  = 30;  // if number of entries in the TX FIFO <= TxThresholdLevel, TX interrupt asserted
+	USI_SSI_InitStruct->USI_SPI_DmaRxDataLevel    = 3;
+	USI_SSI_InitStruct->USI_SPI_DmaTxDataLevel    = 56;
 	USI_SSI_InitStruct->USI_SPI_ClockDivider      = 6;
-	USI_SSI_InitStruct->USI_SPI_DataFrameNumber   =    0;
+	USI_SSI_InitStruct->USI_SPI_DataFrameNumber   = 0;
 	USI_SSI_InitStruct->USI_SPI_DataFrameSize     = USI_SPI_DFS_8_BITS;
-	USI_SSI_InitStruct->USI_SPI_InterruptMask     =  0x0;
-	USI_SSI_InitStruct->USI_SPI_SclkPhase             = USI_SPI_SCPH_TOGGLES_AT_START;
-	USI_SSI_InitStruct->USI_SPI_SclkPolarity          = USI_SPI_SCPOL_INACTIVE_IS_HIGH;
-	USI_SSI_InitStruct->USI_SPI_TransferMode          = USI_SPI_TMOD_TR;
+	USI_SSI_InitStruct->USI_SPI_InterruptMask     = 0x0;
+	USI_SSI_InitStruct->USI_SPI_SclkPhase         = USI_SPI_SCPH_TOGGLES_IN_MIDDLE;
+	USI_SSI_InitStruct->USI_SPI_SclkPolarity      = USI_SPI_SCPOL_INACTIVE_IS_LOW;
+	USI_SSI_InitStruct->USI_SPI_TransferMode      = USI_SPI_TMOD_TR;
 
-	USI_SSI_InitStruct->USI_SPI_RxSampleDelay	=	0;
-	USI_SSI_InitStruct->USI_SPI_SSTogglePhase	=	0;
+	USI_SSI_InitStruct->USI_SPI_RxSampleDelay     = 0;
+	USI_SSI_InitStruct->USI_SPI_SSTogglePhase     = 0;
 }
 
 
@@ -99,7 +100,7 @@ USI_SSI_StructInit(USI_SSI_InitTypeDef* USI_SSI_InitStruct)
   * @retval None
   */
 
-void USI_SSI_Init(USI_TypeDef *usi_dev, USI_SSI_InitTypeDef *USI_SSI_InitStruct)
+void USI_SSI_InitEx(USI_TypeDef *usi_dev, USI_SSI_InitTypeDef *USI_SSI_InitStruct)
 {
 	u32 TempValue1  = 0, TempValue2 = 0;
 
@@ -108,12 +109,12 @@ void USI_SSI_Init(USI_TypeDef *usi_dev, USI_SSI_InitTypeDef *USI_SSI_InitStruct)
 
 	/* Set USI to SPI mode */
 	TempValue1 = usi_dev->USI_MODE_CTRL;
-	TempValue1  &= ~USI_SERIAL_MODE;
+	TempValue1 &= ~USI_SERIAL_MODE;
 	TempValue1 |= USI_SERIAL_SPI_MODE;
 	usi_dev->USI_MODE_CTRL = TempValue1;
 
 	/* Disable SPI and Tx/Rx Path, for some bits in SPI_CTRL are writeable only when Tx/Rx path are both disable.*/	
-	USI_SSI_Cmd(usi_dev, DISABLE);
+	USI_SSI_Reset(usi_dev, ENABLE);
 	USI_SSI_TRxPath_Cmd(usi_dev, USI_SPI_RX_ENABLE | USI_SPI_TX_ENABLE, DISABLE);
 
 	/* Set SPI Control Register */
@@ -135,6 +136,11 @@ void USI_SSI_Init(USI_TypeDef *usi_dev, USI_SSI_InitTypeDef *USI_SSI_InitStruct)
 
 	/* Set Tx/Rx FIFO Threshold Level*/
 	usi_dev->TX_FIFO_CTRL = USI_SPI_TX_FIFO_DEPTH - USI_SSI_InitStruct->USI_SPI_TxThresholdLevel;
+	/*
+	 * TX interrupt when (empty-entries >= 64 - USI_SPI_TxThresholdLevel),
+	 * (USI_SPI_TxThresholdLevel >= 64 - empty-entries = valid-entries)
+	 * (valid-entries <= USI_SPI_TxThresholdLevel)
+	 */
 	usi_dev->RX_FIFO_CTRL = USI_SSI_InitStruct->USI_SPI_RxThresholdLevel + 1;
 
 	/* Set interrupt */
@@ -145,22 +151,22 @@ void USI_SSI_Init(USI_TypeDef *usi_dev, USI_SSI_InitTypeDef *USI_SSI_InitStruct)
 
 	/* Set Tx/Rx Path enable */
 	switch(USI_SSI_InitStruct->USI_SPI_TransferMode){
-		case USI_SPI_TMOD_TO:
-			TempValue2 |= USI_SPI_TX_ENABLE;
+	case USI_SPI_TMOD_TO:
+		TempValue2 |= USI_SPI_TX_ENABLE;
 		break;
-		case USI_SPI_TMOD_RO:
-			TempValue2 |= USI_SPI_RX_ENABLE;
+	case USI_SPI_TMOD_RO:
+		TempValue2 |= USI_SPI_RX_ENABLE;
 		break;
-		case USI_SPI_TMOD_TR:
-			TempValue2 |= (USI_SPI_TX_ENABLE | USI_SPI_RX_ENABLE);
+	case USI_SPI_TMOD_TR:
+		TempValue2 |= (USI_SPI_TX_ENABLE | USI_SPI_RX_ENABLE);
 		break;
-		default:
+	default:
 		break;
 	}
 	usi_dev->SPI_TRANS_EN  = TempValue2;
 
 	/* Enable SPI. SPI can work normally when Tx/Rx Path and all logic are released.*/
-	USI_SSI_Cmd(usi_dev, ENABLE);
+	USI_SSI_Reset(usi_dev, DISABLE);
 }
 
 /**
@@ -172,13 +178,43 @@ void USI_SSI_Init(USI_TypeDef *usi_dev, USI_SSI_InitTypeDef *USI_SSI_InitStruct)
   * @retval None
   */
 
-void USI_SSI_Cmd(USI_TypeDef *usi_dev, u32 NewStatus)
+void USI_SSI_CmdEx(USI_TypeDef *usi_dev, u32 NewStatus)
 {
-	if (NewStatus != DISABLE) {
+	USI_SSI_TRxPath_Cmd(usi_dev, USI_SPI_RX_ENABLE | USI_SPI_TX_ENABLE, NewStatus);
+}
+
+/**
+  * @brief  Reset or release USI-SPI peripheral.
+  * @param  usi_dev: where usi_dev can be USI0_DEV.
+  * @param  NewStatus: This parameter can be one of the following values:
+  *            @arg ENABLE reset the device
+  *            @arg DISABLE
+  * @retval None
+  */
+void USI_SSI_Reset(USI_TypeDef *usi_dev, u32 NewStatus)
+{
+	if (NewStatus == DISABLE) {
 		usi_dev->SW_RESET |= USI_SW_RESET_RSTB | USI_SW_RESET_RXFIFO_RSTB |
 			USI_SW_RESET_TXFIFO_RSTB | USI_SW_RESET_RX_RSTB | USI_SW_RESET_TX_RSTB;
 	} else {
 		usi_dev->SW_RESET &= ~USI_SW_RESET_RSTB;
 	}
 }
+
+/**
+  * @brief  Enables or disables slave .
+  * @note  Valid only when the device is configured as a master.
+  * @param  spi_dev: where spi_dev can be USI0_DEV.
+  * @param  SlaveIndex: the index of slave to be selected.
+  * @retval None
+  */
+void USI_SSI_SetSlaveEnable(USI_TypeDef *spi_dev, u32 SlaveIndex)
+{
+	(void) spi_dev;
+	(void) SlaveIndex;
+	/* empty implementation */
+	return;
+}
+
+/******************* (C) COPYRIGHT 2016 Realtek Semiconductor *****END OF FILE****/
 
