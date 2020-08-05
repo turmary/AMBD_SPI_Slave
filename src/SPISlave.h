@@ -45,7 +45,11 @@ class SPISlave_ : public Stream
     size_t write(uint8_t data);
     size_t write(const uint8_t * data, size_t quantity);
 
+    size_t readBytes( char *buffer, size_t length); // read chars from stream into buffer
+    size_t readBytes( uint8_t *buffer, size_t length) { return readBytes((char *)buffer, length); }
+
     virtual int available(void);
+    int availableForStore(void);
     virtual int read(void);
     virtual int peek(void);
     virtual void flush(void);
@@ -98,10 +102,14 @@ class SPISlave_ : public Stream
     volatile int _rxCnt;
     volatile uint8_t regAddr;
     // Interrupt ENable
-    volatile uint16_t regIEN;
+    volatile uint16_t rvIEN;
+    // Interrupt STATUS
+    volatile uint16_t rvIRQ;
 
     static const uint16_t ID;
     static const char* Name;
+
+    bool _intr_write;
 };
 
 extern SPISlave_ SPISlave;

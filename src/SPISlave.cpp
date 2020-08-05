@@ -32,6 +32,7 @@ extern "C" {
 #define RTL87XX_SYNC  PA_13
 
 /* IRQ0 Levels */
+/* On master side, slave busy if it haven't data to send */
 #define SPI_SLAVE_BUSY  1
 /* On slave side, we haven't data to send, should named IDLE not BUSY. */
 #define SPI_SLAVE_IDLE  1
@@ -59,9 +60,9 @@ enum {
 	REG_CTRL,    /* rw */
 	REG_STS,     /* ro */
 	REG_IEN,     /* rw */
-	#define IEN_TX 0x0001     // have data to master
-	#define IEN_RX 0x0002     // have space could receive from master
-	REG_IRQ,     /* r1c */
+	#define IEN_STX 0x0001     // have data to master, slave TX
+	#define IEN_SRX 0x0002     // have space could receive from master, slave RX
+	REG_IRQ,     /* ro */      // auto cleared each reading
 	REG_RLEN = 0x10,
 	             /* rw,
 	              * R -- how many bytes could read from this slave
@@ -97,7 +98,9 @@ SPISlave_::SPISlave_(USI_TypeDef* udev, int pinMOSI, int pinMISO, int pinSCLK, i
 
 	bytesWR = bytesRD = 0;
 
-	regIEN = 0;
+	rvIRQ = rvIEN = 0;
+
+	_intr_write = true;
 }
 
 // set ID & name
@@ -134,16 +137,25 @@ extern "C" u32 SPISlave_IT_HANDLER(void* dummy) {
 	USI_SSI_TRxPath_Cmd(udev, USI_SPI_RX_ENABLE, _en); \
 	} while(0)
 
+#define __IRQ_OUT(_v) \
+	do { \
+		if (pinIRQ >= 0) { \
+			gpio_write(&irqOut, _v); \
+		} \
+	} while(0)
+
 
 void SPISlave_::begin(void) {
-	/*
-	 * IRQ0 output high level,
-	 * if this/slave have no events
-	 */
-	gpio_init(&irqOut, (PinName)pinIRQ);
-	gpio_write(&irqOut, SPI_SLAVE_IDLE);
-	gpio_mode(&irqOut, PullUp);
-	gpio_dir(&irqOut, PIN_OUTPUT);
+	if (pinIRQ >= 0) {
+		/*
+		 * IRQ0 output high level,
+		 * if this/slave have no events
+		 */
+		gpio_init(&irqOut, (PinName)pinIRQ);
+		gpio_write(&irqOut, SPI_SLAVE_IDLE);
+		gpio_mode(&irqOut, PullUp);
+		gpio_dir(&irqOut, PIN_OUTPUT);
+	}
 
 	RCC_PeriphClockCmd(APBPeriph_USI_REG, APBPeriph_USI_CLOCK, ENABLE);
 
@@ -241,17 +253,31 @@ size_t SPISlave_::write(uint8_t ucData)
 	}
 
 	txBuffer.store_char( ucData );
+	if (_intr_write && (rvIEN & IEN_STX)) {
+		rvIRQ |= IEN_STX;
+		__IRQ_OUT(SPI_SLAVE_READY);
+	}
 	return 1 ;
 }
 
 size_t SPISlave_::write(const uint8_t * data, size_t quantity) {
+	_intr_write = false;
+
 	// Try to store all data
 	for (size_t i = 0; i < quantity; ++i) {
 		// Return the number of data stored,
 		// when the buffer is full (if write return 0)
-		if(!write(data[i]))
-			return i;
+		if(!write(data[i])) {
+			quantity = i;
+			break;
+		}
 	}
+	if (quantity && (rvIEN & IEN_STX)) {
+		rvIRQ |= IEN_STX;
+		__IRQ_OUT(SPI_SLAVE_READY);
+	}
+
+	_intr_write = true;
 
 	// All data stored
 	return quantity;
@@ -262,9 +288,46 @@ int SPISlave_::available(void)
 	return rxBuffer.available();
 }
 
+int SPISlave_::availableForStore(void)
+{
+	return txBuffer.availableForStore();
+}
+
 int SPISlave_::read(void)
 {
-	return rxBuffer.read_char();
+	int c;
+	c = rxBuffer.read_char();
+
+	if (rvIEN & IEN_SRX) {
+		rvIRQ |= IEN_SRX;
+		__IRQ_OUT(SPI_SLAVE_READY);
+	}
+	return c;
+}
+
+size_t SPISlave_::readBytes(char *buffer, size_t length)
+{
+	size_t av;
+
+	if (!(av = rxBuffer.available())) {
+		return av;
+	}
+	if (length > av) {
+		length = av;
+	}
+
+	char* bufend = buffer + length;
+	uint8_t c;
+
+	for (; buffer < bufend;) {
+		*buffer++ = c;
+	}
+
+	if (rvIEN & IEN_SRX) {
+		rvIRQ |= IEN_SRX;
+		__IRQ_OUT(SPI_SLAVE_READY);
+	}
+	return length;
 }
 
 int SPISlave_::peek(void)
@@ -333,17 +396,15 @@ void SPISlave_::_regRD(void) {
 
 	switch (regAddr) {
 	case REG_ID:
-		_write((uint8_t*)&ID, sizeof ID);
+		v = ID;
 		break;
 
 	case REG_VER:
-		_write((uint8_t*)&DEV_VER, sizeof DEV_VER);
+		v = DEV_VER;
 		break;
 
 	case REG_NAME:
 		v = (*name) & 0xFF;
-		_write((uint8_t*)&v, sizeof v);
-
 		if (!v) {
 			name = Name;
 		} else {
@@ -352,27 +413,30 @@ void SPISlave_::_regRD(void) {
 		break;
 
 	case REG_IEN:
-		v = regIEN;
-		_write((uint8_t*)&v, sizeof v);
+		v = rvIEN;
+		break;
+
+	case REG_IRQ:
+		v = rvIRQ;
+		rvIRQ = 0;
+		__IRQ_OUT(SPI_SLAVE_IDLE);
 		break;
 
 	case REG_RLEN:
 		av = txBuffer.available();
 		v = (av > 0xFFFF)? 0xFFFF: av;
-		_write((uint8_t*)&v, sizeof v);
 		break;
 
 	case REG_WLEN:
 		av = rxBuffer.availableForStore();
 		v = (av > 0xFFFF)? 0xFFFF: av;
-		_write((uint8_t*)&v, sizeof v);
 		break;
 
 	default:
 		v = 0;
-		_write((uint8_t*)&v, sizeof(v));
 		break;
 	}
+	_write((uint8_t*)&v, sizeof v);
 
 	#if 0
 	regAddr = REG_NULL;
@@ -396,7 +460,23 @@ void SPISlave_::_regWR(void) {
 
 	switch (regAddr & REG_MASK) {
 	case REG_IEN:
-		regIEN = v;
+		rvIEN = v;
+		// rvIRQ &= rvIEN;
+		/* interrupt immediately if condition satisfied */
+		if ((rvIEN & IEN_STX) && txBuffer.available()) {
+			rvIRQ |= IEN_STX;
+		}
+		if ((rvIEN & IEN_SRX) && rxBuffer.availableForStore()) {
+			rvIRQ |= IEN_SRX;
+		}
+		if (rvIRQ) {
+			__IRQ_OUT(SPI_SLAVE_READY);
+		}
+		break;
+
+	case REG_IRQ:
+		// rvIRQ &= ~v;
+		// __IRQ_OUT(SPI_SLAVE_IDLE);
 		break;
 
 	case REG_RLEN:
@@ -495,7 +575,7 @@ __more_bytes:
 	}
 
 	if (_rxBuf[0] & TAG_WRITE) {
-		/* Don't change regAddr */
+		/* Don't change regAddr now */
 		if (_rxCnt < 3) {
 			/* insufficient bytes to write register */
 			return;
