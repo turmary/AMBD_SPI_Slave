@@ -198,7 +198,7 @@ void SPISlave_::begin(void) {
 
 	__USI_ENABLE_RX(udev, ENABLE);
 
-	__SYNC_OUT(SPI_SLAVE_READY);
+	__SYNC_OUT(SPI_SLAVE_BUSY);
 
 	return;
 }
@@ -484,6 +484,7 @@ void SPISlave_::_regRD(void) {
 	}
 
 	__USI_ENABLE_TX(udev, ENABLE);
+	__SYNC_OUT(SPI_SLAVE_READY);
 
 	#if 0
 	regAddr = REG_NULL;
@@ -573,6 +574,7 @@ void SPISlave_::_regWR(void) {
 	v = TAG_ACK;
 	_write((uint8_t*)&v, 1);
 	__USI_ENABLE_TX(udev, ENABLE);
+	__SYNC_OUT(SPI_SLAVE_READY);
 
 	return;
 }
@@ -674,8 +676,6 @@ void SPISlave_::onService(void)
 
 	USI_SSI_SetIsrClean(udev, status);
 
-	__SYNC_OUT(SPI_SLAVE_BUSY);
-
 	if (status &
 	(USI_TXFIFO_OVERFLOW_INTS | USI_TXFIFO_UNDERFLOW_INTS |
 	 /* USI_RXFIFO_OVERFLOW_INTS |*/ USI_RXFIFO_UNDERFLOW_INTS |
@@ -696,10 +696,12 @@ void SPISlave_::onService(void)
 			/* transfer limit register content complete */
 			/* Not resort these statements order */
 			__USI_ENABLE_TX(udev, DISABLE);
+			__SYNC_OUT(SPI_SLAVE_BUSY);
 			__USI_ENABLE_RX(udev, ENABLE);
 		} else if (bytesRD <= 0) {
 			/* TX transfer complete */
 			__USI_ENABLE_TX(udev, DISABLE);
+			__SYNC_OUT(SPI_SLAVE_BUSY);
 			__USI_ENABLE_RX(udev, ENABLE);
 			regAddr = REG_NULL;
 			bytesRD = 0;
@@ -716,7 +718,6 @@ void SPISlave_::onService(void)
 			}
 		}
 	}
-	__SYNC_OUT(SPI_SLAVE_READY);
 }
 
 SPISlave_ SPISlave(USI0_DEV, USI_SPI_MOSI, USI_SPI_MISO, USI_SPI_SCLK, USI_SPI_CS, RTL87XX_IRQ0);

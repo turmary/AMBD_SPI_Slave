@@ -51,13 +51,13 @@ enum {
 
 /* No less than 60 us between REG(read) byte and VALUE bytes. */
 const int _WAIT_SLAVE_READY_US = 70;
-const int _WAIT_SLAVE_READ_ACK = 50000;
+const int _WAIT_SLAVE_READ_ACK = 100000;
 
 int at_wait_io(int level) {
   int i;
   for (i = 0; digitalRead(chipSyncPin) != level; i++) {
     delayMicroseconds(10);
-    if (i > 5000) {
+    if (i > _WAIT_SLAVE_READ_ACK / 10) {
       return -1;
     }
   }
@@ -65,8 +65,6 @@ int at_wait_io(int level) {
 }
 
 int spi_transfer_cs(uint8_t v) {
-
-  at_wait_io(SPI_SLAVE_READY);
 
   // take the chip select low to select the device
   digitalWrite(chipSelectPin, LOW);
@@ -81,8 +79,6 @@ int spi_transfer_cs(uint8_t v) {
 
 int spi_transfer16_cs(uint16_t v) {
   uint16_t r;
-
-  at_wait_io(SPI_SLAVE_READY);
 
   // take the chip select low to select the device
   digitalWrite(chipSelectPin, LOW);
@@ -105,16 +101,9 @@ static int uspi_rd_reg(int reg) {
   // spi_transfer16_cs(((SPT_TAG_RD | reg) << 8) | SPT_TAG_PRE);
   spi_transfer_cs(SPT_TAG_RD | reg);
 
-  int i;
-  for (i = 0; i < _WAIT_SLAVE_READ_ACK; i += 10) {
-    v = spi_transfer_cs(SPT_TAG_RD | reg);
-    if (v == SPT_TAG_ACK) {
-      break;
-    }
-    delayMicroseconds(10);
-  }
-  Serial.printf("#RDW %d\n", i);
-  if (i >= _WAIT_SLAVE_READ_ACK) {
+  at_wait_io(SPI_SLAVE_READY);
+  v = spi_transfer_cs(SPT_TAG_RD | reg);
+  if (v == SPT_TAG_ACK) {
     return -1;
   }
 
@@ -274,7 +263,7 @@ void setup() {
   // give the slave time to set up
   delay(50);
   pinMode(PIN_SERIAL2_RX, INPUT);
-  delay(1000);
+  delay(2000);
 
   // Enable RTL8720D_IRQ0 interrupt
   pinMode(RTL8720D_IRQ0, INPUT_PULLUP);
@@ -301,7 +290,6 @@ void setup() {
     }
   }
   Serial.printf("Slave IEN = %04X loops = %d\n", id, i);
-
 
   if (Serial.available()) {
     uint8_t c;
