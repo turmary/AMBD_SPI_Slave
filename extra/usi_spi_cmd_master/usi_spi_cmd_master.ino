@@ -9,10 +9,21 @@
 // the other you need are controlled by the SPI library):
 #define SPIX             SPI1
 const int chipSelectPin = SS1;
-const int chipSyncPin  =  RTL8720D_GPIO0;
+const int chipSyncPin   = RTL8720D_GPIO0;
+#ifndef RTL8720D_IRQ0
+#define RTL8720D_IRQ0 IRQ0
+#endif
+
+/* On master side, slave busy if it haven't data to send */
+#define SPI_SLAVE_BUSY  1
+#define SPI_SLAVE_READY 0
+
+bool speedMode = false;
 
 // SPI transfer tags, commonly used by target SPI slave device
 enum {
+	SPT_TAG_PRE = 0x55, /* Master initiate a TRANSFER */
+	SPT_TAG_ACK = 0xBE, /* Master READ bytes ready */
 	SPT_TAG_WR  = 0x80, /* Master WRITE  to Slave */
 	SPT_TAG_RD  = 0x00, /* Master READ from Slave */
 	SPT_TAG_DMY = 0xFF, /* dummy */
@@ -28,7 +39,7 @@ enum {
 	USPI_REG_IEN,         /* rw */
 	#define IEN_STX 0x0001     // have data to master
 	#define IEN_SRX 0x0002     // have space could receive from master
-	USPI_REG_IRQ,         /* r1c */
+	USPI_REG_IRQ,         /* ro */
 	USPI_REG_RLEN  = 0x10,/* rw */
 	USPI_REG_WLEN,        /* rw */
 	USPI_REG_RDATA = 0x20,/* wo */
@@ -40,8 +51,23 @@ enum {
 
 /* No less than 60 us between REG(read) byte and VALUE bytes. */
 const int _WAIT_SLAVE_READY_US = 70;
+const int _WAIT_SLAVE_READ_ACK = 50000;
+
+int at_wait_io(int level) {
+  int i;
+  for (i = 0; digitalRead(chipSyncPin) != level; i++) {
+    delayMicroseconds(10);
+    if (i > 5000) {
+      return -1;
+    }
+  }
+  return 0;
+}
 
 int spi_transfer_cs(uint8_t v) {
+
+  at_wait_io(SPI_SLAVE_READY);
+
   // take the chip select low to select the device
   digitalWrite(chipSelectPin, LOW);
 
@@ -56,6 +82,8 @@ int spi_transfer_cs(uint8_t v) {
 int spi_transfer16_cs(uint16_t v) {
   uint16_t r;
 
+  at_wait_io(SPI_SLAVE_READY);
+
   // take the chip select low to select the device
   digitalWrite(chipSelectPin, LOW);
 
@@ -69,30 +97,56 @@ int spi_transfer16_cs(uint16_t v) {
   return r;
 }
 
-static unsigned uspi_rd_reg(int reg) {
+static int uspi_rd_reg(int reg) {
   uint16_t v;
 
   /* To stable from last rd_reg/wr_reg */
-  delayMicroseconds(_WAIT_SLAVE_READY_US);
+  // delayMicroseconds(_WAIT_SLAVE_READY_US);
+  // spi_transfer16_cs(((SPT_TAG_RD | reg) << 8) | SPT_TAG_PRE);
   spi_transfer_cs(SPT_TAG_RD | reg);
 
-  delayMicroseconds(_WAIT_SLAVE_READY_US);
-  v = spi_transfer16_cs((SPT_TAG_DMY << 8) | SPT_TAG_DMY);
+  int i;
+  for (i = 0; i < _WAIT_SLAVE_READ_ACK; i += 10) {
+    v = spi_transfer_cs(SPT_TAG_RD | reg);
+    if (v == SPT_TAG_ACK) {
+      break;
+    }
+    delayMicroseconds(10);
+  }
+  Serial.printf("#RDW %d\n", i);
+  if (i >= _WAIT_SLAVE_READ_ACK) {
+    return -1;
+  }
 
+  v = spi_transfer16_cs((SPT_TAG_DMY << 8) | SPT_TAG_DMY);
   return v;
 }
 
 static int uspi_wr_reg(int reg, unsigned val) {
+  uint16_t v;
   int r;
 
   /* To stable from last rd_reg/wr_reg */
-  delayMicroseconds(_WAIT_SLAVE_READY_US);
+  // delayMicroseconds(_WAIT_SLAVE_READY_US);
+  // spi_transfer16_cs(((SPT_TAG_WR | reg) << 8) | SPT_TAG_PRE);
   spi_transfer_cs(SPT_TAG_WR | reg);
 
   /* Maybe read & write concurrently */
   // delayMicroseconds(_WAIT_SLAVE_READY_US);
   r = spi_transfer16_cs(val);
 
+  int i;
+  for (i = 0; i < _WAIT_SLAVE_READ_ACK; i += 10) {
+    v = spi_transfer_cs(SPT_TAG_DMY);
+    if (v == SPT_TAG_ACK) {
+      break;
+    }
+    delayMicroseconds(10);
+  }
+  Serial.printf("#WRW %d\n", i);
+  if (i >= _WAIT_SLAVE_READ_ACK) {
+    return -1;
+  }
   return r;
 }
 
@@ -100,6 +154,7 @@ int at_cmd_write(const uint8_t* buf, uint16_t len, int loop_wait = 50) {
   uint16_t wlen;
   uint16_t v;
   int r = 0;
+  (void)loop_wait;
 
   // Free space could be wrote into
   if (! (wlen = uspi_rd_reg(USPI_REG_WLEN))) {
@@ -140,6 +195,7 @@ int at_cmd_read(uint8_t* buf, uint16_t len, int loop_wait = 50) {
   uint16_t rlen;
   uint16_t v;
   int r = 0;
+  (void)loop_wait;
 
   // How many bytes could read out
   if (! (rlen = uspi_rd_reg(USPI_REG_RLEN))) {
@@ -175,6 +231,15 @@ __ret:
   return r;
 }
 
+volatile bool slave_interrupt = false;
+void spi_slave_isr(void) {
+  /*
+   *** Dangerous!!! to Read slave register here ***
+   */
+  slave_interrupt = true;
+  return;
+}
+
 void setup() {
   Serial.begin(115200);
   while(!Serial);
@@ -195,6 +260,7 @@ void setup() {
   SPIX.beginTransaction(SPISettings(MAX_SPI / 4, MSBFIRST, SPI_MODE0));
 
   Serial.println("\nConnecting");
+  Serial.println("\nPress key T/t to enter speed testing mode.");
 
   // When RTL8720D startup, set pin UART_LOG_TXD to lowlevel
   // will force the device enter UARTBURN mode.
@@ -208,9 +274,12 @@ void setup() {
   // give the slave time to set up
   delay(50);
   pinMode(PIN_SERIAL2_RX, INPUT);
-  delay(200);
+  delay(1000);
 
-  char idstr[0x20];
+  // Enable RTL8720D_IRQ0 interrupt
+  pinMode(RTL8720D_IRQ0, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(RTL8720D_IRQ0), spi_slave_isr, FALLING);
+
   uint16_t id;
   int i;
   for (i = 0; i < 10000; i++) {
@@ -219,12 +288,10 @@ void setup() {
       break;
     }
   }
-  sprintf(idstr, "Slave ID  = %04X loops = %d", id, i);
-  Serial.println(idstr);
+  Serial.printf("Slave ID  = %04X loops = %d\n", id, i);
 
   id = uspi_rd_reg(USPI_REG_VER);
-  sprintf(idstr, "Slave VER = %d.%d", id >> 8, id & 0xFF);
-  Serial.println(idstr);
+  Serial.printf("Slave VER = %d.%d\n", id >> 8, id & 0xFF);
 
   for (i = 0; i < 10000; i++) {
     uspi_wr_reg(USPI_REG_IEN, IEN_STX | IEN_SRX);
@@ -233,12 +300,96 @@ void setup() {
       break;
     }
   }
-  sprintf(idstr, "Slave IEN = %04X loops = %d", id, i);
-  Serial.println(idstr);
+  Serial.printf("Slave IEN = %04X loops = %d\n", id, i);
 
-  Serial.println("Ready! Enter some AT commands");
 
+  if (Serial.available()) {
+    uint8_t c;
+    c = Serial.read();
+    if (c == 't' || c == 'T') {
+      speedMode = true;
+    }
+  }
+  Serial.println("Ready!");
+  if (speedMode) {
+    Serial.println("Speed testing started ...");
+  } else {
+    Serial.println("Enter some String to transfer");
+  }
   return;
+}
+
+/*
+ * We assume the slave has a big enough buffer
+ * The definition should change both
+ * on Master & Slave example.
+ */
+#define SLAVE_BUF_SZ  (10 * 1024)
+int data_cntr = 0;
+int trans_dir = 0;
+unsigned long tstart;
+#define TEST_BUF_SZ 1024
+uint8_t _tr_buf[TEST_BUF_SZ + 2];
+
+static void speedTest(void) {
+  uint16_t istatus;
+
+  if (data_cntr == 0) {
+    tstart = millis();
+  }
+
+  istatus = 0;
+  if (slave_interrupt) {
+    slave_interrupt = false;
+
+    // Serial.printf("IRQ Level #0 = %d\n",
+    //   digitalRead(RTL8720D_IRQ0));
+    istatus = uspi_rd_reg(USPI_REG_IRQ);
+    Serial.printf("\nIRQ = %04X\n", istatus);
+  }
+
+  if (0 == trans_dir && (istatus & IEN_SRX)) {
+    int i;
+    for (i = 0; i < TEST_BUF_SZ; i++) {
+      _tr_buf[i] = data_cntr + i;
+    }
+
+    i = at_cmd_write(_tr_buf, TEST_BUF_SZ);
+    if (i < 0) {
+      Serial.println("TE#0");
+      return;
+    }
+    data_cntr += i;
+    if (data_cntr >= SLAVE_BUF_SZ) {
+      Serial.printf("Slave RX Transfer %d bytes,\n", data_cntr);
+      Serial.printf("      using %d ms\n", millis() - tstart);
+      data_cntr = 0;
+      trans_dir = 1;
+    }
+  } else
+  if (trans_dir && (istatus & IEN_STX)) {
+    int i, r;
+
+    r = at_cmd_read(_tr_buf, TEST_BUF_SZ);
+    if (r < 0) {
+      Serial.println("RE#0");
+      return;
+    }
+    for (i = 0; i < r; i++) {
+      if (_tr_buf[i] != (uint8_t)(data_cntr + i)) {
+        Serial.printf("RE#1 RCV %02X, EXP %02X\n",
+                      _tr_buf[i], (uint8_t)(data_cntr + i));
+        break;
+      }
+    }
+    data_cntr += r;
+    if (data_cntr >= SLAVE_BUF_SZ) {
+      Serial.printf("Slave TX Transfer %d bytes,\n", data_cntr);
+      Serial.printf("      using %d ms\n", millis() - tstart);
+      data_cntr = 0;
+      trans_dir = 0;
+    }
+  }
 }
 
 #define U_BUF_SZ 254
@@ -247,7 +398,7 @@ uint8_t u_buf[U_BUF_SZ + 2];
 uint8_t s_buf[S_BUF_SZ + 2];
 int idx = 0;
 
-void loop() {
+static void stringTransfer(void) {
   uint8_t c;
   int r;
 
@@ -312,4 +463,13 @@ void loop() {
     // Serial.println("Read OK");
   }
   return;
+}
+
+void loop() {
+  if (speedMode) {
+    speedTest();
+  } else {
+    // stringTransfer();
+    delay(1000);
+  }
 }
