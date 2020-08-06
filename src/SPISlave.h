@@ -76,6 +76,8 @@ class SPISlave_ : public Stream
     int irqUsi; /* USI irq for MCU interrupt */
 
     gpio_t irqOut; /* gpio irq to MASTER device */
+    gpio_t syncOut;/* USI SPI Bug: transfer in FIFO access period,
+                                   May destroy FIFO content */
 
     // RX Buffer
     RingBufferN<SERIAL_BUFFER_SIZE> rxBuffer;

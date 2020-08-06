@@ -82,6 +82,8 @@ enum {
 	REG_NULL  = 0x7F,
 	REG_MASK  = 0x7F,
 	TAG_WRITE = 0x80,
+	TAG_ACK   = 0xBE, /* Master READ bytes ready */
+	TAG_DMY   = 0xFF, /* dummy */
 };
 
 SPISlave_::SPISlave_(USI_TypeDef* udev, int pinMOSI, int pinMISO, int pinSCLK, int pinCS, int pinIRQ2Mst)
@@ -144,6 +146,11 @@ extern "C" u32 SPISlave_IT_HANDLER(void* dummy) {
 		} \
 	} while(0)
 
+#define __SYNC_OUT(_v) \
+	do { \
+		gpio_write(&syncOut, _v); \
+	} while (0)
+
 
 void SPISlave_::begin(void) {
 	if (pinIRQ >= 0) {
@@ -156,6 +163,11 @@ void SPISlave_::begin(void) {
 		gpio_mode(&irqOut, PullUp);
 		gpio_dir(&irqOut, PIN_OUTPUT);
 	}
+
+	gpio_init(&syncOut, (PinName)RTL87XX_SYNC);
+	gpio_write(&syncOut, SPI_SLAVE_IDLE);
+	gpio_mode(&syncOut, PullUp);
+	gpio_dir(&syncOut, PIN_OUTPUT);
 
 	RCC_PeriphClockCmd(APBPeriph_USI_REG, APBPeriph_USI_CLOCK, ENABLE);
 
@@ -171,9 +183,11 @@ void SPISlave_::begin(void) {
 	usIs.USI_SPI_TxThresholdLevel = 0;
 	USI_SSI_InitEx(udev, &usIs);
 
+	USI_SSI_SetBaud(udev, 10* 1000000UL,  CPU_ClkGet(_FALSE) / 2);
+
 	irqUsi = USI_DEV_TABLE[0].IrqNum;
 	InterruptRegister((IRQ_FUN)SPISlave_IT_HANDLER, irqUsi, (u32)NULL, 5);
-	InterruptEn(irqUsi, 5);
+	InterruptEn(irqUsi, 0);
 
 	if (usIs.USI_SPI_SclkPolarity == SCPOL_INACTIVE_IS_LOW) {
 		PAD_PullCtrl((u32)pinSCLK, GPIO_PuPd_DOWN);
@@ -183,6 +197,9 @@ void SPISlave_::begin(void) {
 	PAD_PullCtrl((u32)pinCS, GPIO_PuPd_UP);
 
 	__USI_ENABLE_RX(udev, ENABLE);
+
+	__SYNC_OUT(SPI_SLAVE_READY);
+
 	return;
 }
 
@@ -389,10 +406,13 @@ size_t SPISlave_::_writeFromTxBuf(int max_bytes) {
 void SPISlave_::_regRD(void) {
 	static const char* name = "";
 	uint16_t v;
-	int av;
+	volatile uint32_t tag = TAG_ACK;
+	volatile int av;
 
-	__USI_ENABLE_TX(udev, ENABLE);
 	__USI_ENABLE_RX(udev, DISABLE);
+	/* Clear RX FIFO */
+	udev->SW_RESET &= ~(USI_SW_RESET_RXFIFO_RSTB | USI_SW_RESET_RX_RSTB);
+	udev->SW_RESET |=  (USI_SW_RESET_RXFIFO_RSTB | USI_SW_RESET_RX_RSTB);
 
 	switch (regAddr) {
 	case REG_ID:
@@ -432,11 +452,38 @@ void SPISlave_::_regRD(void) {
 		v = (av > 0xFFFF)? 0xFFFF: av;
 		break;
 
+	case REG_NULL:
 	default:
-		v = 0;
+		/* DEBUG */
+		// tag = TAG_ACK;
+		v = regAddr;
+		tag = 0xFF;
 		break;
 	}
-	_write((uint8_t*)&v, sizeof v);
+
+	tag |= ((unsigned)v << 8);
+	av = tag;
+
+	// uint32_t intr_mask = ulSetInterruptMaskFromISR();
+	__set_PRIMASK(1);
+	/*
+	 * Bug: USI_SSI_Writeable
+	 */
+	__USI_ENABLE_TX(udev, DISABLE);
+	for (v = 0; v < 3;) {
+		(void)av;
+		v += _write(((uint8_t*)&av + v), 3 - v);
+	}
+	// vClearInterruptMaskFromISR(intr_mask);
+	__set_PRIMASK(0);
+	if ((v = USI_SSI_GetTxCount(udev)) != 3) {
+		printf("URX Bug #3 %d\n", v);
+	}
+	if (av != tag) {
+		printf("GCC Bug #1\n");
+	}
+
+	__USI_ENABLE_TX(udev, ENABLE);
 
 	#if 0
 	regAddr = REG_NULL;
@@ -482,14 +529,12 @@ void SPISlave_::_regWR(void) {
 	case REG_RLEN:
 		bytesRD = v;
 		ack = RDATA_ACK << 8;
-		__USI_ENABLE_TX(udev, ENABLE);
 		_write((uint8_t*)&ack, 3);
 		break;
 
 	case REG_WLEN:
 		bytesWR = v;
 		ack = WDATA_ACK << 8;
-		__USI_ENABLE_TX(udev, ENABLE);
 		_write((uint8_t*)&ack, 3);
 		break;
 
@@ -523,6 +568,11 @@ void SPISlave_::_regWR(void) {
 	default:
 		break;
 	}
+
+	/* tell master the regWR successful */
+	v = TAG_ACK;
+	_write((uint8_t*)&v, 1);
+	__USI_ENABLE_TX(udev, ENABLE);
 
 	return;
 }
@@ -570,8 +620,7 @@ __more_bytes:
 			USI_SSI_SetRxFifoLevel(udev, bytesWR - 1);
 		}
 
-		_rxIdx = _rxCnt = 0;
-		return;
+		goto __exit;
 	}
 
 	if (_rxBuf[0] & TAG_WRITE) {
@@ -587,6 +636,11 @@ __more_bytes:
 		regAddr = REG_NULL;
 	}
 
+	/* Ignore rubbish dummy, maybe query bytes of READ command */
+	if (regAddr == REG_NULL) {
+		goto __exit_1;
+	}
+
 	if (regAddr & TAG_WRITE) {
 		_regWR();
 		if (_rxCnt > 3) {
@@ -597,16 +651,19 @@ __more_bytes:
 	} else {
 		_regRD();
 		if (_rxCnt > 1) {
-			printf("URX WRN#2\n");
+			// printf("URX WRN#2\n");
 		}
 	}
+	goto __exit;
 
-	#if 0
+__exit_1:
+	#if 1
 	for (i = 0; i < _rxCnt; i++)
 		printf("%02X ", _rxBuf[i]);
 	printf("\n");
 	#endif
 
+__exit:
 	_rxIdx = _rxCnt = 0;
 	return;
 }
@@ -617,9 +674,11 @@ void SPISlave_::onService(void)
 
 	USI_SSI_SetIsrClean(udev, status);
 
+	__SYNC_OUT(SPI_SLAVE_BUSY);
+
 	if (status &
 	(USI_TXFIFO_OVERFLOW_INTS | USI_TXFIFO_UNDERFLOW_INTS |
-	 USI_RXFIFO_OVERFLOW_INTS | USI_RXFIFO_UNDERFLOW_INTS |
+	 /* USI_RXFIFO_OVERFLOW_INTS |*/ USI_RXFIFO_UNDERFLOW_INTS |
 	 USI_SPI_RX_DATA_FRM_ERR_INTS)
 	) {
 		printf("*BugST=%x\n", (unsigned)status);
@@ -629,13 +688,13 @@ void SPISlave_::onService(void)
 		if (!USI_SSI_Readable(udev)) {
 			printf("URX Bug #1\n");
 		}
-
 		_recv();
 	}
 
 	if (status & USI_TXFIFO_ALMOST_EMTY_INTS) {
 		if (regAddr != (REG_RDATA | TAG_WRITE)) {
 			/* transfer limit register content complete */
+			/* Not resort these statements order */
 			__USI_ENABLE_TX(udev, DISABLE);
 			__USI_ENABLE_RX(udev, ENABLE);
 		} else if (bytesRD <= 0) {
@@ -657,6 +716,7 @@ void SPISlave_::onService(void)
 			}
 		}
 	}
+	__SYNC_OUT(SPI_SLAVE_READY);
 }
 
 SPISlave_ SPISlave(USI0_DEV, USI_SPI_MOSI, USI_SPI_MISO, USI_SPI_SCLK, USI_SPI_CS, RTL87XX_IRQ0);
